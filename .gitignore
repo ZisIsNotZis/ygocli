@@ -1,0 +1,7 @@
+deck
+
+# build outputs
+ygocli
+*.o
+*.a
+*.so
