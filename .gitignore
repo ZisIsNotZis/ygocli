@@ -5,3 +5,6 @@ ygocli
 *.o
 *.a
 *.so
+
+# local logs / traces
+*.log

@@ -4,7 +4,7 @@
 
 ## 30-second snapshot
 
-- **What it is:** single-binary CLI duel runner (`./ygocli <deck0.ydk> <deck1.ydk> [--auto]`)
+- **What it is:** single-binary CLI duel runner (`./ygocli <deck0.ydk> <deck1.ydk> [--auto] [--random]`)
 - **What works now:** deck loading, duel bootstrap, state display, many `MSG_*` handlers, manual + `--auto` play paths
 - **What is rough:** response encoding edge cases, incomplete protocol coverage, long-run stability
 - **What this is great for:** quick local experiments, parser/debug work, and generating logs for analysis
@@ -13,7 +13,7 @@
 
 | Area | Status |
 | --- | --- |
-| Build | ✅ `./build.sh` (Makefile-backed) |
+| Build | ✅ `make` |
 | Basic duel startup | ✅ |
 | Auto-play progression | ✅ (multiple turns observed) |
 | Full battle reliability | ⚠️ Not reliable in all scenarios |
@@ -53,21 +53,33 @@ sudo apt install -y \
 
 ```bash
 # build
-./build.sh
+make
 
 # run (manual)
 ./ygocli deck/260124DD/b7fb7204fab3c94d.ydk deck/260124DD/b7fb7204fab3c94d.ydk
 
 # run (auto decisions)
 ./ygocli deck/260124DD/b7fb7204fab3c94d.ydk deck/260124DD/b7fb7204fab3c94d.ydk --auto
+
+# run (randomized auto decisions)
+./ygocli deck/260124DD/b7fb7204fab3c94d.ydk deck/260124DD/b7fb7204fab3c94d.ydk --random
+
+# targeted regression
+make test-regression
+
+# randomized fuzz runs (random decks + random choices)
+make test-fuzz-random
 ```
 
 ## What’s done
 
-- Makefile-based build flow for this repo (`build.sh` delegates to `make`).
+- Makefile-based build flow for this repo (`make`).
 - `gframe` dependency removed for `ygocli` build path.
 - Message-driven duel loop with game-state printing and interactive decision points.
 - Support for loading `.ydk` decks (`#main`, `#extra`, stop at `!side`).
+- Added deterministic seed support via `YGOCLI_SEED` for reproducible runs/tests.
+- Added random-choice mode via `--random` or `YGOCLI_RANDOM_CHOICES=1` (`YGOCLI_CHOICE_SEED` for reproducibility).
+- Added automated regression + mass autoplay + random-choice fuzz scripts under `tests/`.
 
 ## What’s not done (yet)
 

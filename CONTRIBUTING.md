@@ -22,9 +22,10 @@ Thanks for contributing.
 ## Local checks
 
 ```bash
-./build.sh clean
-./build.sh
+make clean
+make
 ./ygocli <deck0.ydk> <deck1.ydk> [--auto]
+bash tests/fuzz_random_choices.sh /home/z/ygo/deck 100 15
 ```
 
 ## Notes

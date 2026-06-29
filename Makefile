@@ -20,7 +20,7 @@ endif
 CXXFLAGS += $(LUA_CFLAGS)
 LDLIBS += $(LUA_LIBS)
 
-.PHONY: all clean
+.PHONY: all clean test-regression test-mass test-fuzz-random
 
 all: $(TARGET)
 
@@ -29,3 +29,12 @@ $(TARGET): $(SRC) $(OCGCORE_SRCS)
 
 clean:
 	rm -f $(TARGET)
+
+test-regression: $(TARGET)
+	bash tests/regression_no_retry.sh
+
+test-mass: $(TARGET)
+	bash tests/mass_autoplay.sh
+
+test-fuzz-random: $(TARGET)
+	bash tests/fuzz_random_choices.sh

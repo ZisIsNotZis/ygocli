@@ -7,8 +7,8 @@ What changed and why?
 Commands used:
 
 ```bash
-./build.sh clean
-./build.sh
+make clean
+make
 ./ygocli <deck0.ydk> <deck1.ydk> [--auto]
 ```
 
