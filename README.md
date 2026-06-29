@@ -1,5 +1,7 @@
 # ygocli
 
+**English | [中文](README.zh.md)**
+
 **A minimal, text-first Yu-Gi-Oh! duel client powered by `ocgcore`** — fast to run, easy to instrument, and useful for debugging engine behavior and collecting duel traces.
 
 ## 30-second snapshot
