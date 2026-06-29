@@ -48,6 +48,7 @@ public:
 std::unordered_map<uint32_t, std::string> card_names;
 std::unordered_map<uint32_t, std::string> card_descs;
 std::unordered_map<uint32_t, card_data> card_datas;
+std::unordered_map<uint32_t, std::string> sys_strings;
 sqlite3* db = nullptr;
 
 void load_card_database(const std::string& db_path) {
@@ -93,10 +94,56 @@ void load_card_database(const std::string& db_path) {
     }
 }
 
+void load_strings_conf(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (line.rfind("!system", 0) != 0) {
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string tag;
+        std::string id_text;
+        if (!(iss >> tag >> id_text)) {
+            continue;
+        }
+
+        std::string value;
+        std::getline(iss, value);
+        auto first = value.find_first_not_of(" \t");
+        if (first == std::string::npos) {
+            continue;
+        }
+        value.erase(0, first);
+        while (!value.empty() && (value.back() == '\r' || value.back() == '\n' || value.back() == ' ' || value.back() == '\t')) {
+            value.pop_back();
+        }
+
+        uint32_t id = static_cast<uint32_t>(std::strtoul(id_text.c_str(), nullptr, 0));
+        sys_strings[id] = value;
+    }
+}
+
 std::string get_card_name(uint32_t id) {
     if (id == 0) return "None";
     if (card_names.count(id)) return card_names[id];
     return "Card-" + std::to_string(id);
+}
+
+std::string get_sys_string(uint32_t id) {
+    auto it = sys_strings.find(id);
+    if (it != sys_strings.end()) {
+        return it->second;
+    }
+    return "Sys-" + std::to_string(id);
 }
 
 std::string normalize_effect_text(const std::string& src) {
@@ -120,31 +167,43 @@ std::string normalize_effect_text(const std::string& src) {
 
 std::string card_type_brief(uint32_t type) {
     std::vector<std::string> parts;
-    if (type & TYPE_MONSTER) parts.push_back("Monster");
-    if (type & TYPE_SPELL) parts.push_back("Spell");
-    if (type & TYPE_TRAP) parts.push_back("Trap");
-    if (type & TYPE_NORMAL) parts.push_back("Normal");
-    if (type & TYPE_EFFECT) parts.push_back("Effect");
-    if (type & TYPE_RITUAL) parts.push_back("Ritual");
-    if (type & TYPE_FUSION) parts.push_back("Fusion");
-    if (type & TYPE_SYNCHRO) parts.push_back("Synchro");
-    if (type & TYPE_XYZ) parts.push_back("Xyz");
-    if (type & TYPE_LINK) parts.push_back("Link");
-    if (type & TYPE_PENDULUM) parts.push_back("Pendulum");
-    if (type & TYPE_TUNER) parts.push_back("Tuner");
-    if (type & TYPE_QUICKPLAY) parts.push_back("Quick-Play");
-    if (type & TYPE_CONTINUOUS) parts.push_back("Continuous");
-    if (type & TYPE_EQUIP) parts.push_back("Equip");
-    if (type & TYPE_FIELD) parts.push_back("Field");
-    if (type & TYPE_COUNTER) parts.push_back("Counter");
-    if (type & TYPE_FLIP) parts.push_back("Flip");
-    if (type & TYPE_TOON) parts.push_back("Toon");
+    static const std::pair<uint32_t, uint32_t> type_ids[] = {
+        {TYPE_MONSTER, 1050},
+        {TYPE_SPELL, 1051},
+        {TYPE_TRAP, 1052},
+        {TYPE_NORMAL, 1054},
+        {TYPE_EFFECT, 1055},
+        {TYPE_FUSION, 1056},
+        {TYPE_RITUAL, 1057},
+        {TYPE_SPIRIT, 1059},
+        {TYPE_UNION, 1060},
+        {TYPE_DUAL, 1061},
+        {TYPE_TUNER, 1062},
+        {TYPE_SYNCHRO, 1063},
+        {TYPE_TOKEN, 1064},
+        {TYPE_QUICKPLAY, 1066},
+        {TYPE_CONTINUOUS, 1067},
+        {TYPE_EQUIP, 1068},
+        {TYPE_FIELD, 1069},
+        {TYPE_COUNTER, 1070},
+        {TYPE_FLIP, 1071},
+        {TYPE_TOON, 1072},
+        {TYPE_XYZ, 1073},
+        {TYPE_PENDULUM, 1074},
+        {TYPE_SPSUMMON, 1075},
+        {TYPE_LINK, 1076},
+    };
+    for (const auto& [flag, sys_id] : type_ids) {
+        if (type & flag) {
+            parts.push_back(get_sys_string(sys_id));
+        }
+    }
     if (parts.empty()) {
-        return "Type=" + std::to_string(type);
+        return get_sys_string(1053);
     }
     std::string out;
     for (size_t i = 0; i < parts.size(); ++i) {
-        if (i) out += "/";
+        if (i) out += "|";
         out += parts[i];
     }
     return out;
@@ -154,16 +213,14 @@ std::string get_card_bracket_info(uint32_t code) {
     auto dit = card_datas.find(code);
     std::string effect = normalize_effect_text(card_descs.count(code) ? card_descs[code] : "");
     if (effect.empty()) effect = "-";
-    if (dit == card_datas.end()) {
-        return "(type:- lv:- atk:- def:- effect:" + effect + ")";
-    }
+    if (dit == card_datas.end()) return "(" + get_sys_string(1053) + " - -/- " + effect + ")";
     const auto& d = dit->second;
     uint32_t lv = d.level & 0xff;
-    return "(type:" + card_type_brief(d.type)
-        + " lv:" + std::to_string(lv)
-        + " atk:" + std::to_string(d.attack)
-        + " def:" + std::to_string(d.defense)
-        + " effect:" + effect + ")";
+    return "(" + card_type_brief(d.type)
+        + " " + std::to_string(lv)
+        + " " + std::to_string(d.attack)
+        + "/" + std::to_string(d.defense)
+        + " " + effect + ")";
 }
 
 std::string location_name(uint32_t loc) {
@@ -570,6 +627,7 @@ int main(int argc, char* argv[]) {
 
     // Load card database
     load_card_database("./cards.cdb");
+    load_strings_conf("./strings.conf");
 
     // Load decks
     Deck decks[2];
@@ -735,23 +793,14 @@ int main(int argc, char* argv[]) {
                         case RESPONSE_B: std::cout << "RESPONSE_B (length: " << last_response_b_length << ")"; break;
                     }
                     std::cout << "\nLast pduel: " << last_pduel << ", Current pduel: " << pduel << "\n";
-
                     if (last_response_type != RESPONSE_NONE && last_pduel == pduel) {
-                        std::cout << "Re-sending last response\n";
-                        if (last_response_type == RESPONSE_I) {
-                            std::cout << "Re-sending int response: " << last_response_i << "\n";
-                            cache_and_set_responsei(pduel, last_response_i);
-                        } else if (last_response_type == RESPONSE_B) {
-                            std::cout << "Re-sending buffer response (length: " << last_response_b_length << "): ";
-                            for (size_t i = 0; i < last_response_b_length; i++) {
-                                std::cout << std::hex << (int)last_response_b[i] << " ";
-                            }
-                            std::cout << std::dec << "\n";
-                            cache_and_set_responseb(pduel, last_response_b.data(), last_response_b_length);
-                        }
+                        std::cout << "Retry requested; waiting for the prompt again.\n";
                     } else {
                         std::cout << "ERROR: No cached response to retry or pduel mismatch\n";
                     }
+                    last_response_type = RESPONSE_NONE;
+                    last_response_b.clear();
+                    last_response_b_length = 0;
                     break;
                 }
                 case MSG_WIN: {
@@ -1614,14 +1663,14 @@ int main(int argc, char* argv[]) {
                     uint8_t player = BufferIO::Read<uint8_t>(pbuf);
                     uint8_t count = BufferIO::Read<uint8_t>(pbuf);
                     std::cout << "Player " << (int)player << " select option (" << (int)count << " options):\n";
+                    if (!auto_play) {
+                        display_game_state();
+                    }
                     for(int i = 0; i < count; i++) {
                         int32_t opt = BufferIO::Read<int32_t>(pbuf);
                         if (!auto_play) {
                             std::cout << "  [" << i << "] Option " << opt << "\n";
                         }
-                    }
-                    if (!auto_play) {
-                        display_game_state();
                     }
                     if (count == 1) {
                         std::cout << "Only one option, auto-selecting 0\n";
@@ -1629,12 +1678,12 @@ int main(int argc, char* argv[]) {
                     } else if (auto_play) {
                         cache_and_set_responsei(pduel, count > 0 ? (random_choices ? rand_int_inclusive(0, count - 1) : 0) : -1);
                     } else {
-                        std::cout << "Your choice (-1 to cancel, 0-" << (int)(count-1) << "): ";
+                        std::cout << "Your choice (0-" << (int)(count-1) << "): ";
                         std::cout.flush();
                         std::string line;
                         std::getline(std::cin, line);
                         try { int choice = std::stoi(line); cache_and_set_responsei(pduel, choice); }
-                        catch (...) { cache_and_set_responsei(pduel, -1); }
+                        catch (...) { cache_and_set_responsei(pduel, 0); }
                     }
                     break;
                 }
@@ -1661,6 +1710,9 @@ int main(int argc, char* argv[]) {
                               << ", min=" << (int)min
                               << ", max=" << (int)max
                               << ", count=" << (int)count << "):\n";
+                    if (!auto_play) {
+                        display_game_state();
+                    }
                     for(int i = 0; i < count; i++) {
                         uint32_t code = BufferIO::Read<int32_t>(pbuf);
                         uint8_t ctrl = BufferIO::Read<uint8_t>(pbuf);
@@ -1687,9 +1739,6 @@ int main(int argc, char* argv[]) {
                                 std::cout << "  [+" << i << "] " << get_card_name(code) << "\n";
                             }
                         }
-                    }
-                    if (!auto_play) {
-                        display_game_state();
                     }
                     if (count == (int)min && !cancelable && min == max) {
                         std::cout << "Auto-selecting (no choice)\n";
@@ -1750,17 +1799,19 @@ int main(int argc, char* argv[]) {
                                 cache_and_set_responseb(pduel, buf, 2);
                             }
                         } else {
-                            std::cout << "Your choice (space/comma-separated indices, -1 to cancel): ";
+                            std::cout << "Your choice (" << (cancelable ? "space/comma-separated indices, -1 to cancel" : "space/comma-separated indices") << "): ";
                             std::cout.flush();
                             std::string line;
                             std::getline(std::cin, line);
-                            try {
-                                int cancel_choice = std::stoi(line);
-                                if(cancel_choice == -1) {
-                                    cache_and_set_responsei(pduel, -1);
-                                    break;
-                                }
-                            } catch (...) {}
+                            if (cancelable) {
+                                try {
+                                    int cancel_choice = std::stoi(line);
+                                    if (cancel_choice == -1) {
+                                        cache_and_set_responsei(pduel, -1);
+                                        break;
+                                    }
+                                } catch (...) {}
+                            }
                             std::replace(line.begin(), line.end(), ',', ' ');
                             std::stringstream ss(line);
                             std::vector<uint8_t> indices;
@@ -1771,10 +1822,8 @@ int main(int argc, char* argv[]) {
                                 }
                             }
                             if(indices.size() < min) {
-                                indices.clear();
-                                for(int i = 0; i < min && i < count; ++i) {
-                                    indices.push_back(static_cast<uint8_t>(i));
-                                }
+                                std::cout << "Invalid choice, try again\n";
+                                continue;
                             }
                             if(indices.size() > max) {
                                 indices.resize(max);
@@ -1794,6 +1843,9 @@ int main(int argc, char* argv[]) {
                     (void)spe_count; (void)hint0; (void)hint1;
                     std::cout << "Player " << (int)player << " chain (count=" << (int)chain_count
                               << ", spe_count=" << (int)spe_count << "):\n";
+                    if (!auto_play) {
+                        display_game_state();
+                    }
                     bool any_forced_chain = false;
                     for(int i = 0; i < chain_count; i++) {
                         uint8_t flag = BufferIO::Read<uint8_t>(pbuf);
@@ -1814,9 +1866,6 @@ int main(int argc, char* argv[]) {
                                       << ", forced=" << (int)forced_chain
                                       << ", desc=" << desc << ")\n";
                         }
-                    }
-                    if (!auto_play) {
-                        display_game_state();
                     }
                     if (chain_count == 0 && !spe_count) {
                         std::cout << "No chain options, auto-selecting -1\n";
@@ -1852,12 +1901,14 @@ int main(int argc, char* argv[]) {
                     uint8_t count = BufferIO::Read<uint8_t>(pbuf);
                     uint32_t forbidden = BufferIO::Read<uint32_t>(pbuf);
                     uint32_t selectable = ~forbidden;
-                    
+
                     std::cout << "Player " << (int)player << " select place"
                               << " (count=" << (int)count
                               << ", forbidden=0x" << std::hex << forbidden << std::dec << ")\n";
-                    
-                    // Show selectable options
+                    if (!auto_play) {
+                        display_game_state();
+                    }
+
                     struct PlaceOption {
                         int ctrl;
                         int loc;
@@ -1865,34 +1916,26 @@ int main(int argc, char* argv[]) {
                         std::string name;
                     };
                     std::vector<PlaceOption> options;
-                    
-                    // Check player 0 MZONE (bits 0-6)
+
                     for (int i = 0; i < 7; i++) {
                         if (selectable & (0x1U << i)) {
                             options.push_back({0, LOCATION_MZONE, i, "P0-MZone[" + std::to_string(i) + "]"});
                         }
                     }
-                    // Check player 0 SZONE (bits 8-15)
                     for (int i = 0; i < 8; i++) {
                         if (selectable & (0x100U << i)) {
                             options.push_back({0, LOCATION_SZONE, i, "P0-SZone[" + std::to_string(i) + "]"});
                         }
                     }
-                    // Check player 1 MZONE (bits 16-22)
                     for (int i = 0; i < 7; i++) {
                         if (selectable & (0x10000U << i)) {
                             options.push_back({1, LOCATION_MZONE, i, "P1-MZone[" + std::to_string(i) + "]"});
                         }
                     }
-                    // Check player 1 SZONE (bits 24-31)
                     for (int i = 0; i < 8; i++) {
                         if (selectable & (0x1000000U << i)) {
                             options.push_back({1, LOCATION_SZONE, i, "P1-SZone[" + std::to_string(i) + "]"});
                         }
-                    }
-
-                    if (!auto_play) {
-                        display_game_state();
                     }
 
                     if (!auto_play) {
@@ -1901,19 +1944,19 @@ int main(int argc, char* argv[]) {
                             std::cout << "  [" << i << "] " << options[i].name << "\n";
                         }
                     }
-                    
+
                     unsigned char buf[3] = {0, LOCATION_MZONE, 0};
                     int selected_idx = 0;
                     if (auto_play && random_choices && !options.empty()) {
                         selected_idx = rand_int_inclusive(0, static_cast<int>(options.size()) - 1);
                     }
-                    
+
                     if (options.size() > 0) {
                         buf[0] = options[selected_idx].ctrl;
                         buf[1] = options[selected_idx].loc;
                         buf[2] = options[selected_idx].seq;
                     }
-                    
+
                     if (auto_play || options.size() == 1) {
                         if (options.size() == 1 && !auto_play) {
                             std::cout << "Only one option, auto-selecting " << options[0].name << "\n";
@@ -1941,7 +1984,6 @@ int main(int argc, char* argv[]) {
                             std::cout.flush();
                         }
                     } else {
-                        // No options, just send something
                         cache_and_set_responseb(pduel, buf, 3);
                     }
                     break;
@@ -1952,6 +1994,9 @@ int main(int argc, char* argv[]) {
                     uint32_t code = BufferIO::Read<uint32_t>(pbuf);
                     uint8_t positions = BufferIO::Read<uint8_t>(pbuf);
                     std::cout << "Player " << (int)player << " select position for " << get_card_name(code) << ":\n";
+                    if (!auto_play) {
+                        display_game_state();
+                    }
                     int pos_count = 0;
                     if (!auto_play) {
                         int opt_idx = 0;
@@ -1971,9 +2016,6 @@ int main(int argc, char* argv[]) {
                             std::cout << "  [" << opt_idx++ << "] Face-Down Defense\n";
                             pos_count++;
                         }
-                    }
-                    if (!auto_play) {
-                        display_game_state();
                     }
                     int pos = POS_FACEUP_ATTACK;
                     std::vector<int> valid_positions;
@@ -2013,6 +2055,9 @@ int main(int argc, char* argv[]) {
                               << ", min=" << (int)min
                               << ", max=" << (int)max
                               << ", must=" << (int)must_count << "):\n";
+                    if (!auto_play) {
+                        display_game_state();
+                    }
                     for(int i = 0; i < must_count; i++) {
                         uint32_t code = BufferIO::Read<uint32_t>(pbuf);
                         uint8_t ctrl = BufferIO::Read<uint8_t>(pbuf);
@@ -2035,9 +2080,6 @@ int main(int argc, char* argv[]) {
                         if (!auto_play) {
                             std::cout << "  [" << i << "] " << get_card_name(code) << "\n";
                         }
-                    }
-                    if (!auto_play) {
-                        display_game_state();
                     }
                     if (select_count == 0 && min == 0) {
                         std::cout << "No choices needed, auto-selecting\n";
@@ -2081,6 +2123,9 @@ int main(int argc, char* argv[]) {
                               << " (type=" << counter_type
                               << ", count=" << counter_count
                               << ", cards=" << (int)card_count << "):\n";
+                    if (!auto_play) {
+                        display_game_state();
+                    }
                     for(int i = 0; i < card_count; i++) {
                         uint32_t code = BufferIO::Read<uint32_t>(pbuf);
                         uint8_t ctrl = BufferIO::Read<uint8_t>(pbuf);
@@ -2092,7 +2137,6 @@ int main(int argc, char* argv[]) {
                             std::cout << "  [" << i << "] " << get_card_name(code) << "\n";
                         }
                     }
-                    display_game_state();
                     if (auto_play) {
                         cache_and_set_responsei(pduel, random_choices && card_count > 0 ? rand_int_inclusive(0, card_count - 1) : 0);
                     } else {
@@ -2123,19 +2167,6 @@ int main(int argc, char* argv[]) {
                             else cache_and_set_responsei(pduel, 0);
                         } catch (...) { cache_and_set_responsei(pduel, 0); }
                     }
-                    break;
-                }
-                case MSG_HINT: {
-                    uint8_t type = BufferIO::Read<uint8_t>(pbuf);
-                    uint8_t player = BufferIO::Read<uint8_t>(pbuf);
-                    int32_t data = BufferIO::Read<int32_t>(pbuf);
-                    std::cout << "Hint: type=" << (int)type << ", player=" << (int)player << ", data=" << data << "\n";
-                    break;
-                }
-                case MSG_SHUFFLE_DECK: {
-                    uint8_t player = BufferIO::Read<uint8_t>(pbuf);
-                    std::cout << "Player " << (int)player << " shuffles deck\n";
-                    needs_display_after = true;
                     break;
                 }
                 case MSG_SHUFFLE_HAND: {
