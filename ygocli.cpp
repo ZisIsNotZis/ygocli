@@ -315,6 +315,7 @@ std::string st_pos_label(int pos) {
 // Level/rank label for a field monster: "Lv4" / "R3" (Xyz).
 // get_level() returns 0 for Xyz/Link monsters, so rank must be passed for Xyz.
 std::string mcp_lv_label(uint32_t code, uint32_t level, uint32_t rank) {
+    (void)code;  // code is not needed; level/rank come from the query
     if (rank) return " R" + std::to_string(rank & 0xff);
     return " Lv" + std::to_string(level & 0xff);
 }
@@ -784,11 +785,6 @@ std::string card_detail_line(uint32_t code) {
     }
     const auto& d = dit->second;
     std::string out = get_card_name(code);
-    // Setcode
-    bool has_set = false;
-    for (int i = 0; i < SIZE_SETCODE; i++) {
-        if (d.setcode[i]) { has_set = true; break; }
-    }
     std::string type_str = card_type_en(d.type);
     if (d.type & TYPE_MONSTER) {
         uint32_t lv = d.level & 0xff;
@@ -923,6 +919,7 @@ std::string mcp_format_output(const std::string& narration, const std::string& c
 }
 
 void display_location_cards(int player, uint32_t location, const char* label, bool show_details = false) {
+    (void)label;
     uint8_t buffer[8192];
     uint32_t query_flags = QUERY_CODE | QUERY_POSITION;
     if (show_details) {
@@ -941,9 +938,6 @@ void display_location_cards(int player, uint32_t location, const char* label, bo
                 int32_t flag = BufferIO::Read<int32_t>(card_p);
                 uint32_t code = 0;
                 uint8_t pos = 0;
-                int32_t atk = 0;
-                int32_t def = 0;
-                uint32_t lv = 0;
 
                 if (flag & QUERY_CODE) {
                     code = BufferIO::Read<uint32_t>(card_p);
@@ -959,7 +953,7 @@ void display_location_cards(int player, uint32_t location, const char* label, bo
                     BufferIO::Read<uint32_t>(card_p);
                 }
                 if (flag & QUERY_LEVEL) {
-                    lv = BufferIO::Read<uint32_t>(card_p);
+                    BufferIO::Read<uint32_t>(card_p);
                 }
                 if (flag & QUERY_RANK) {
                     BufferIO::Read<uint32_t>(card_p);
@@ -971,10 +965,10 @@ void display_location_cards(int player, uint32_t location, const char* label, bo
                     BufferIO::Read<uint32_t>(card_p);
                 }
                 if (flag & QUERY_ATTACK) {
-                    atk = BufferIO::Read<int32_t>(card_p);
+                    BufferIO::Read<int32_t>(card_p);
                 }
                 if (flag & QUERY_DEFENSE) {
-                    def = BufferIO::Read<int32_t>(card_p);
+                    BufferIO::Read<int32_t>(card_p);
                 }
 
                 if (code != 0) {
@@ -1220,7 +1214,7 @@ int mcp_run_until_pause() {
                         uint8_t new_seq = BufferIO::Read<uint8_t>(pbuf);
                         uint8_t new_pos = BufferIO::Read<uint8_t>(pbuf);
                         int32_t reason = BufferIO::Read<int32_t>(pbuf);
-                        (void)prev_ctrl;(void)prev_pos;(void)new_pos;
+                        (void)prev_ctrl;(void)prev_pos;(void)new_pos;(void)reason;
                         std::cout << get_card_name(code) << " moved: "
                                   << location_name(prev_loc) << "[" << (int)prev_seq << "]"
                                   << " -> " << location_name(new_loc) << "[" << (int)new_seq << "]"
@@ -1729,10 +1723,6 @@ std::string mcp_build_choices() {
     auto rd8 = [&]() -> uint8_t { if (p < end) return *p++; return 0; };
     auto rd16 = [&]() -> uint16_t { uint16_t v=0; if (p+2<=end) std::memcpy(&v,p,2); p+=2; return v; };
     auto rd32 = [&]() -> uint32_t { uint32_t v=0; if (p+4<=end) std::memcpy(&v,p,4); p+=4; return v; };
-    auto rd_pt = [&]() { rd32(); rd8(); rd8(); rd8(); };              // 7 bytes
-    auto rd_act = [&]() { rd32(); rd8(); rd8(); rd8(); rd32(); };     // 11 bytes
-    auto rd_card9 = [&]() { rd32(); rd8(); rd8(); rd8(); rd8(); };    // 8 bytes (code+4)
-
     if (type == MSG_SELECT_IDLECMD) {
         rd8(); // skip player byte
         uint8_t sm = rd8();
@@ -1793,7 +1783,7 @@ std::string mcp_build_choices() {
         (void)spe;
         rd32(); rd32(); // hint0, hint1
         for (int i=0;i<cnt;i++){
-            uint8_t edesc = rd8();
+            rd8(); // edesc
             uint8_t forced = rd8();
             uint32_t c = rd32();
             uint32_t il = rd32();  // info_location: ctrl + loc<<8 + seq<<16 + pos<<24
@@ -2414,10 +2404,10 @@ static std::string mcp_tool_card_search(const nlohmann::json& params) {
     return out.str();
 }
 
-// Register engine callbacks (card data + scripts + logs). The CLI does this at
-// startup; MCP mode needs it too, otherwise the engine has no card data and
-// nothing is summonable.
-static void mcp_setup_engine() {
+// Register engine callbacks (card data reader, script reader that resolves
+// bare names against script/ while passing absolute paths through, and the
+// error-message logger). Shared by the solo (MCP) and auto-play paths.
+static void setup_engine_callbacks() {
     set_card_reader([](uint32_t code, card_data* data) -> uint32_t {
         auto it = card_datas.find(code);
         if (it != card_datas.end()) {
@@ -2461,10 +2451,17 @@ static void mcp_setup_engine() {
     });
 }
 
-// Initialize a duel (reused by ygo_single_mode and the initial setup)
+static void mcp_setup_engine() {
+    setup_engine_callbacks();
+}
+
+// Initialize a duel (reused by ygo_solo and the initial setup). The optional
+// setup_lua runs in the duel's lua context between deck creation and
+// start_duel (puzzle support): the script can call Duel.* helpers
+// (e.g. Duel.SetLP(1, 100)) to build a puzzle state.
 static bool mcp_init_duel(const std::string& deck0_path, const std::string& deck1_path,
-                          int start_lp, int start_hand, int draw_count, int rule) {
-    // Clean up existing duel
+                          int start_lp, int start_hand, int draw_count, int rule,
+                          const std::string& setup_lua = "") {
     if (global_pduel != 0) {
         end_duel(global_pduel);
         global_pduel = 0;
@@ -2510,54 +2507,6 @@ static bool mcp_init_duel(const std::string& deck0_path, const std::string& deck
         }
     }
 
-    start_duel(pduel, DUEL_SIMPLE_AI | ((uint32_t)rule << 16));
-    mcp_engine_buffer.resize(SIZE_MESSAGE_BUFFER);
-    mcp_reset_game_state();
-    return true;
-}
-
-// Same as mcp_init_duel, but runs an optional setup.lua in the duel's lua
-// context between deck creation and start_duel (puzzle support). The script
-// can call Duel.* helpers (e.g. Duel.SetLP(1, 100)) to build a puzzle state.
-static bool mcp_init_duel_setup(const std::string& deck0_path, const std::string& deck1_path,
-                                int start_lp, int start_hand, int draw_count, int rule,
-                                const std::string& setup_lua) {
-    if (global_pduel != 0) {
-        end_duel(global_pduel);
-        global_pduel = 0;
-        last_successful_msg.clear();
-        last_successful_msg_length = 0;
-        last_response_type = RESPONSE_NONE;
-        last_response_b.clear();
-        last_response_b_length = 0;
-    }
-    Deck decks[2];
-    decks[0] = load_deck(deck0_path);
-    decks[1] = load_deck(deck1_path);
-    if (decks[0].main.empty() || decks[1].main.empty()) return false;
-    std::mt19937 rng_shuffle;
-    std::random_device rd_shuffle;
-    rng_shuffle.seed(rd_shuffle());
-    for (int i = 0; i < 2; i++) {
-        std::shuffle(decks[i].main.begin(), decks[i].main.end(), rng_shuffle);
-        std::shuffle(decks[i].extra.begin(), decks[i].extra.end(), rng_shuffle);
-    }
-    uint32_t seed[SEED_COUNT];
-    std::random_device rd;
-    for (int i = 0; i < SEED_COUNT; i++) seed[i] = rd();
-    mcp_setup_engine();
-    intptr_t pduel = create_duel_v2(seed);
-    global_pduel = pduel;
-    set_player_info(pduel, 0, start_lp, start_hand, draw_count);
-    set_player_info(pduel, 1, start_lp, start_hand, draw_count);
-    for (int i = 0; i < 2; i++) {
-        for (size_t j = 0; j < decks[i].main.size(); j++) {
-            new_card(pduel, decks[i].main[j], i, i, LOCATION_DECK, decks[i].main.size() - 1 - j, POS_FACEDOWN_DEFENSE);
-        }
-        for (size_t j = 0; j < decks[i].extra.size(); j++) {
-            new_card(pduel, decks[i].extra[j], i, i, LOCATION_EXTRA, j, POS_FACEDOWN_DEFENSE);
-        }
-    }
     if (!setup_lua.empty()) {
         if (preload_script(pduel, setup_lua.c_str()) == OPERATION_FAIL) {
             char log_buf[2048] = {};
@@ -2728,11 +2677,6 @@ static const std::vector<ToolDef>& tools_registry() {
                       {"draw_count", "integer", "Cards drawn per turn (default 1)"},
                       {"rule", "integer", "Master rule version"}}),
          mcp_tool_ygo_single_mode},
-        {"ygo_single_mode",
-         "Deprecated alias of ygo_solo (kept for compatibility).",
-         tool_schema({{"deck0", "string", "Path to deck0 .ydk file"},
-                      {"deck1", "string", "Path to deck1 .ydk file"}}),
-         mcp_tool_ygo_single_mode},
         {"ygo_client",
          "Connect to a ygocli/gframe server as a player. First call joins the room, uploads "
          "your deck and becomes Ready; the host auto-starts once both players are in. "
@@ -2767,10 +2711,6 @@ static const std::vector<ToolDef>& tools_registry() {
                       {"type", "string", "Type filter, e.g. Monster|Effect|Xyz"},
                       {"race", "string", "Race filter, e.g. Dragon|Machine"},
                       {"attribute", "string", "Attribute filter, e.g. Fire|Light"}}),
-         mcp_tool_card_search},
-        {"ygo_card_search",
-         "Deprecated alias of ygo_card (kept for compatibility).",
-         tool_schema({{"text", "string", "Words that must appear in name/desc"}}),
          mcp_tool_card_search},
         {"ygo_wiki",
          "Search the bundled wiki (wiki/ folder of small markdown files) for concepts. "
@@ -2997,7 +2937,7 @@ static std::string mcp_tool_ygo_puzzle(const nlohmann::json& params) {
     int draw_count = params.value("draw_count", 1);
     int rule = params.value("rule", CURRENT_RULE);
 
-    if (!mcp_init_duel_setup(deck0, deck1, lp, start_hand, draw_count, rule, setup_lua)) {
+    if (!mcp_init_duel(deck0, deck1, lp, start_hand, draw_count, rule, setup_lua)) {
         return "Error: failed to load puzzle (deck0=" + deck0 + " deck1=" + deck1 + ")";
     }
     mcp_begin_capture();
@@ -3595,7 +3535,7 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
         }
         case MSG_MOVE: {
             uint8_t* pbufw = pbuf;
-            int pc = pbuf[4], pl = pbuf[5], cc = pbuf[8], cl = pbuf[9], cs = pbuf[10];
+            int pc = pbuf[4], pl = pbuf[5], cc = pbuf[8], cl = pbuf[9];
             uint8_t cp = pbuf[11];
             (void)pc; (void)pl;
             bool hide_code = (cp & POS_FACEDOWN) != 0 && (cp & POS_REVEAL) == 0;
@@ -3613,12 +3553,12 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
                 BufferIO::Write<int32_t>(pbufw, 0);
             srv_send_msg(1 - cc, offset, pbuf);
             srv_send_obs(offset, pbuf);
-            if (cl != 0 && (cl & LOCATION_OVERLAY) == 0 && (cl != (uint32_t)pl || pc != cc))
+            if (cl != 0 && (cl & LOCATION_OVERLAY) == 0 && (cl != pl || pc != cc))
                 srv_refresh_location(cc, cl, QUERY_TYPE, true);
             break;
         }
         case MSG_POS_CHANGE: {
-            int cc = pbuf[4], cl = pbuf[5], cs = pbuf[6], pp = pbuf[7], cp = pbuf[8];
+            int cc = pbuf[4], cl = pbuf[5], pp = pbuf[6], cp = pbuf[7];
             pbuf += 9;
             srv_send_msg_both(offset, pbuf);
             if ((pp & POS_FACEDOWN) && (cp & POS_FACEUP))
@@ -3634,7 +3574,7 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
             break;
         }
         case MSG_SWAP: {
-            int c1 = pbuf[4], l1 = pbuf[5], s1 = pbuf[6], c2 = pbuf[12], l2 = pbuf[13], s2 = pbuf[14];
+            int c1 = pbuf[4], l1 = pbuf[5], c2 = pbuf[12], l2 = pbuf[13];
             pbuf += 16;
             srv_send_msg_both(offset, pbuf);
             srv_refresh_location(c1, l1, QUERY_TYPE, true);
@@ -3911,6 +3851,32 @@ static void srv_send_join(int seat) {
 // drive it to completion (game 1 = after RPS+TP; games 2+ = after side phase).
 // swap=true means player 1 (seat 1) goes first. Saves a replay at game end.
 // Returns true when the game ended with a legitimate winner (not an abort).
+// Parse a CTOS_UPDATE_DECK payload (uint32 mainc, uint32 sidec, then codes)
+// into main/extra/side lists, splitting extra-deck monsters by card type.
+// Returns false on malformed input.
+static bool srv_parse_deck_payload(const std::vector<uint8_t>& payload,
+                                   std::vector<uint32_t>& main, std::vector<uint32_t>& extra,
+                                   std::vector<uint32_t>& side) {
+    main.clear(); extra.clear(); side.clear();
+    if (payload.size() < 8) return false;
+    uint32_t mainc, sidec;
+    std::memcpy(&mainc, payload.data(), 4);
+    std::memcpy(&sidec, payload.data() + 4, 4);
+    if ((size_t)(mainc + sidec) > payload.size() / 4) return false;
+    const uint8_t* dp = payload.data() + 8;
+    for (uint32_t i = 0; i < mainc; ++i) {
+        uint32_t code; std::memcpy(&code, dp + i * 4, 4);
+        auto it = card_datas.find(code);
+        bool is_extra = it != card_datas.end() && (it->second.type & TYPES_EXTRA_DECK);
+        if (is_extra) extra.push_back(code); else main.push_back(code);
+    }
+    for (uint32_t i = 0; i < sidec; ++i) {
+        uint32_t code; std::memcpy(&code, dp + (mainc + i) * 4, 4);
+        side.push_back(code);
+    }
+    return true;
+}
+
 static bool srv_play_one_game(bool swap, int game_index) {
     Deck decks[2];
     decks[0] = Deck{srv_players[0].deck_main, srv_players[0].deck_extra};
@@ -3968,7 +3934,6 @@ static bool srv_play_one_game(bool swap, int game_index) {
     start_duel(global_pduel, opt);
     srv_game_loop();
     // game over (win, surrender, or abort)
-    srv_duel_stage = DUEL_STAGE_END;
     if (global_pduel) { end_duel(global_pduel); global_pduel = 0; }
     srv_save_replay(game_index);
     bool ok = !srv_duel_abort && srv_last_winner >= 0;
@@ -3982,7 +3947,6 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
     fprintf(stderr, "ygocli server listening on %s:%u\n", bind_ip.empty() ? "0.0.0.0" : bind_ip.c_str(), (unsigned)port);
 
     for (int i = 0; i < SRV_MAX_SEATS; ++i) { srv_players[i] = ServerPlayer(); srv_players[i].type = 0xff; }
-    bool host_info_received = false;
     bool deck_received[2] = {false, false};
     int host_started = 0;
     srv_match_mode = false;
@@ -4046,7 +4010,6 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
                     if (!c) break;
                     srv_room_pass += c;
                 }
-                host_info_received = true;
                 if (seat != 0) {
                     std::swap(srv_players[0], srv_players[seat]);
                     seat = 0;
@@ -4086,25 +4049,10 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
                 srv_players[seat].state = (seat >= SRV_PLAYER_SEATS) ? 0xff : CTOS_UPDATE_DECK;
                 srv_send_join(seat);
             } else if (pkt == CTOS_UPDATE_DECK) {
-                if (payload.size() < 8) { reject_seat(seat, ERRMSG_DECKERROR, 0); continue; }
-                uint32_t mainc, sidec;
-                std::memcpy(&mainc, payload.data(), 4);
-                std::memcpy(&sidec, payload.data() + 4, 4);
-                if ((size_t)(mainc + sidec) > payload.size() / 4) { reject_seat(seat, ERRMSG_DECKERROR, 0); continue; }
-                const uint8_t* dp = payload.data() + 8;
-                srv_players[seat].deck_main.clear();
-                srv_players[seat].deck_extra.clear();
-                srv_players[seat].deck_side.clear();
-                for (uint32_t i = 0; i < mainc; ++i) {
-                    uint32_t code; std::memcpy(&code, dp + i * 4, 4);
-                    auto it = card_datas.find(code);
-                    bool is_extra = it != card_datas.end() && (it->second.type & TYPES_EXTRA_DECK);
-                    if (is_extra) srv_players[seat].deck_extra.push_back(code);
-                    else srv_players[seat].deck_main.push_back(code);
-                }
-                for (uint32_t i = 0; i < sidec; ++i) {
-                    uint32_t code; std::memcpy(&code, dp + (mainc + i) * 4, 4);
-                    srv_players[seat].deck_side.push_back(code);
+                if (!srv_parse_deck_payload(payload, srv_players[seat].deck_main,
+                                            srv_players[seat].deck_extra, srv_players[seat].deck_side)) {
+                    reject_seat(seat, ERRMSG_DECKERROR, 0);
+                    continue;
                 }
                 if (srv_players[seat].deck_main.size() < 40 || srv_players[seat].deck_main.size() > 60
                         || srv_players[seat].deck_extra.size() > 15) {
@@ -4182,7 +4130,6 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
     }
 
     // ---- Game 1: RPS + turn preference. ----
-    bool game1_played = false;
     while (srv_duel_stage == DUEL_STAGE_FINGER || srv_duel_stage == DUEL_STAGE_FIRSTGO) {
         for (int seat = 0; seat < 2; ++seat) {
             std::vector<uint8_t> payload;
@@ -4225,7 +4172,6 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
                 bool swap = ((payload[0] && seat == 1) || (!payload[0] && seat == 0));
                 srv_duel_stage = DUEL_STAGE_DUELING;
                 srv_play_one_game(swap, 1);
-                game1_played = true;
                 srv_duel_stage = DUEL_STAGE_SIDING;
             }
         }
@@ -4252,23 +4198,9 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
                 uint8_t pkt = 0;
                 int n = srv_read_packet(seat, &pkt, payload, 50);
                 if (n < 0) continue;   // 50ms poll timeout; keep waiting
-                if (pkt != CTOS_UPDATE_DECK || payload.size() < 8) continue;
-                uint32_t mainc, sidec;
-                std::memcpy(&mainc, payload.data(), 4);
-                std::memcpy(&sidec, payload.data() + 4, 4);
-                if ((size_t)(mainc + sidec) > payload.size() / 4) continue;
-                const uint8_t* dp = payload.data() + 8;
+                if (pkt != CTOS_UPDATE_DECK) continue;
                 std::vector<uint32_t> nm, ne, ns;
-                for (uint32_t i = 0; i < mainc; ++i) {
-                    uint32_t code; std::memcpy(&code, dp + i * 4, 4);
-                    auto it = card_datas.find(code);
-                    bool is_extra = it != card_datas.end() && (it->second.type & TYPES_EXTRA_DECK);
-                    if (is_extra) ne.push_back(code); else nm.push_back(code);
-                }
-                for (uint32_t i = 0; i < sidec; ++i) {
-                    uint32_t code; std::memcpy(&code, dp + (mainc + i) * 4, 4);
-                    ns.push_back(code);
-                }
+                if (!srv_parse_deck_payload(payload, nm, ne, ns)) continue;
                 if (nm.size() < 40 || nm.size() > 60 || ne.size() > 15) {
                     STOC_ErrorMsg err{}; err.msg = ERRMSG_SIDEERROR; err.code = 0;
                     net::write_packet(srv_players[seat].fd, STOC_ERROR_MSG, (const uint8_t*)&err, 8);
@@ -4634,6 +4566,24 @@ static int cli_process_game_msg(uint8_t* data, size_t len) {
 // Returns: 0 = prompt pending (cli_has_prompt), 1 = game over (MSG_WIN or
 // STOC_DUEL_END), 2 = fatal error received from server (STOC_ERROR_MSG),
 // -1 = timeout / disconnected.
+// Build a CTOS_UPDATE_DECK payload (mainc+sidec header + card codes). Used for
+// the initial upload and for the match side-deck re-upload.
+static std::vector<uint8_t> cli_build_deck_payload(const std::vector<uint32_t>& codes) {
+    std::vector<uint8_t> dk;
+    uint32_t mainc = (uint32_t)codes.size();
+    uint32_t sidec = 0;
+    uint8_t hdr[8];
+    std::memcpy(hdr, &mainc, 4);
+    std::memcpy(hdr + 4, &sidec, 4);
+    dk.insert(dk.end(), hdr, hdr + 8);
+    for (uint32_t c : codes) {
+        uint8_t b[4];
+        std::memcpy(b, &c, 4);
+        dk.insert(dk.end(), b, b + 4);
+    }
+    return dk;
+}
+
 static int cli_read_until_prompt(int timeout_ms) {
     std::vector<uint8_t> buf;
     while (true) {
@@ -4675,16 +4625,7 @@ static int cli_read_until_prompt(int timeout_ms) {
             // Match side-deck phase: re-upload our deck (side changes are not yet
             // exposed; same-deck continuation keeps the match flowing).
             if (!cli_deck_codes.empty()) {
-                std::vector<uint8_t> dk;
-                uint32_t mainc = (uint32_t)cli_deck_codes.size();
-                uint32_t sidec = 0;
-                uint8_t hdr[8];
-                std::memcpy(hdr, &mainc, 4);
-                std::memcpy(hdr + 4, &sidec, 4);
-                dk.insert(dk.end(), hdr, hdr + 8);
-                for (uint32_t c : cli_deck_codes) {
-                    uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4);
-                }
+                std::vector<uint8_t> dk = cli_build_deck_payload(cli_deck_codes);
                 net::write_packet(net_client_fd, CTOS_UPDATE_DECK, dk.data(), dk.size());
             }
             continue;
@@ -4833,12 +4774,7 @@ static int cli_connect_and_join(const std::string& host, uint16_t port,
     }
 
     // upload deck (main+extra as one list; server splits by type)
-    std::vector<uint8_t> dk;
-    uint32_t mainc = (uint32_t)cli_deck_codes.size();
-    uint32_t sidec = 0;
-    uint8_t hdr[8]; std::memcpy(hdr, &mainc, 4); std::memcpy(hdr + 4, &sidec, 4);
-    dk.insert(dk.end(), hdr, hdr + 8);
-    for (uint32_t c : cli_deck_codes) { uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4); }
+    std::vector<uint8_t> dk = cli_build_deck_payload(cli_deck_codes);
     net::write_packet(net_client_fd, CTOS_UPDATE_DECK, dk.data(), dk.size());
 
     // ready
@@ -5143,17 +5079,11 @@ int main(int argc, char* argv[]) {
         if (cmd == "mcp") { mcp_mode = true; }
     }
 
-    // --mcp works with no deck args (decks arrive via ygo_client params).
-    bool wants_mcp = false;
-    for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--mcp") wants_mcp = true;
-    if (wants_mcp) mcp_mode = true;
-
     if (argc < 3 && !mcp_mode) {
         std::cerr << "Usage: " << argv[0] << " <deck0.ydk> <deck1.ydk> [--auto]\n";
         std::cerr << "       " << argv[0] << " server [--port N] [--bind ip]   launch a duel server\n";
         std::cerr << "       " << argv[0] << " mcp                          launch MCP server (JSON-RPC over stdio)\n";
         std::cerr << "       " << argv[0] << " interact                     interactive mode (same engine as MCP)\n";
-        std::cerr << "       " << argv[0] << " --mcp                        (alias of mcp)\n";
         return 1;
     }
 
@@ -5200,7 +5130,7 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> deck_paths;
         for (int i = 1; i < argc; i++) {
             std::string a = argv[i];
-            if (a == "--mcp" || a == "--auto" || a == "--random") continue;
+            if (a == "--auto" || a == "--random") continue;
             if (!a.empty() && a[0] != '/' && !orig_cwd.empty())
                 a = orig_cwd + "/" + a;
             deck_paths.push_back(a);
@@ -5272,47 +5202,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    set_card_reader([](uint32_t code, card_data* data) -> uint32_t {
-        auto it = card_datas.find(code);
-        if (it != card_datas.end()) {
-            *data = it->second;
-            return 0;
-        }
-        data->clear();
-        return 0;
-    });
-    set_script_reader([](const char* script_name, int* len) -> byte* {
-        std::string requested = script_name ? script_name : "";
-        std::string path;
-        if (!requested.empty() && (requested[0] == '/' || requested.rfind("./", 0) == 0
-                                   || requested.rfind("../", 0) == 0)) {
-            path = requested;            // absolute / explicit relative paths pass through
-        } else if (requested.rfind("script/", 0) == 0) {
-            path = "./" + requested;
-        } else {
-            path = "./script/" + requested;   // bare names resolve against script/
-        }
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file.is_open()) {
-            *len = 0;
-            return nullptr;
-        }
-        *len = file.tellg();
-        file.seekg(0, std::ios::beg);
-        char* buf = new char[*len + 1];
-        file.read(buf, *len);
-        buf[*len] = '\0';
-        return reinterpret_cast<byte*>(buf);
-    });
-    set_message_handler([](intptr_t pduel, uint32_t msg_type) -> uint32_t {
-        (void)msg_type;
-        char log_buf[2048] = {};
-        get_log_message(pduel, log_buf);
-        if (log_buf[0] != '\0') {
-            print_core_error(log_buf);
-        }
-        return 0;
-    });
+    setup_engine_callbacks();
 
     intptr_t pduel = create_duel_v2(seed);
     global_pduel = pduel;
@@ -5356,8 +5246,6 @@ int main(int argc, char* argv[]) {
 
             // Inner while loop to process multiple messages from one buffer
             while (pbuf - msg_buffer < (int)len) {
-                uint8_t* msg_start = pbuf;
-
                 uint8_t* offset = pbuf;
                 uint8_t msg_type = BufferIO::Read<uint8_t>(pbuf);
 
@@ -5534,12 +5422,11 @@ int main(int argc, char* argv[]) {
                 }
                 case MSG_POS_CHANGE: {
                     uint32_t code = BufferIO::Read<uint32_t>(pbuf);
-                    uint8_t player = BufferIO::Read<uint8_t>(pbuf);
+                    BufferIO::Read<uint8_t>(pbuf); // player
                     uint8_t location = BufferIO::Read<uint8_t>(pbuf);
                     uint8_t sequence = BufferIO::Read<uint8_t>(pbuf);
-                    uint8_t prev_pos = BufferIO::Read<uint8_t>(pbuf);
+                    BufferIO::Read<uint8_t>(pbuf); // prev_pos
                     uint8_t new_pos = BufferIO::Read<uint8_t>(pbuf);
-                    (void)prev_pos;
                     std::cout << get_card_name(code) << " position changed: "
                               << location_name(location) << "[" << (int)sequence << "]"
                               << " -> " << pos_name(new_pos) << "\n";
@@ -5554,7 +5441,7 @@ int main(int argc, char* argv[]) {
                 }
                 case MSG_CHAINING: {
                     uint32_t code = BufferIO::Read<uint32_t>(pbuf);
-                    uint8_t player = BufferIO::Read<uint8_t>(pbuf);
+                    BufferIO::Read<uint8_t>(pbuf); // player
                     uint8_t location = BufferIO::Read<uint8_t>(pbuf);
                     uint8_t sequence = BufferIO::Read<uint8_t>(pbuf);
                     uint8_t sub_seq = BufferIO::Read<uint8_t>(pbuf);
@@ -6022,22 +5909,22 @@ int main(int argc, char* argv[]) {
                     count = BufferIO::Read<uint8_t>(pbuf);
                     total_options += count;
                     for (int i = 0; i < count; ++i) {
-                        uint32_t code = BufferIO::Read<int32_t>(pbuf);  // code
-                        uint8_t ctrl = BufferIO::Read<uint8_t>(pbuf);  // controler
-                        uint8_t loc = BufferIO::Read<uint8_t>(pbuf);  // location
-                        uint8_t seq = BufferIO::Read<uint8_t>(pbuf);  // sequence
-                        int32_t desc = BufferIO::Read<int32_t>(pbuf);  // description
+                        BufferIO::Read<int32_t>(pbuf);  // code
+                        BufferIO::Read<uint8_t>(pbuf);  // controler
+                        BufferIO::Read<uint8_t>(pbuf);  // location
+                        BufferIO::Read<uint8_t>(pbuf);  // sequence
+                        BufferIO::Read<int32_t>(pbuf);  // description
                     }
 
                     // Attackable: each is 8 bytes {code:int32, ctrl:u8, loc:u8, seq:u8, direct_attackable:u8}
                     count = BufferIO::Read<uint8_t>(pbuf);
                     total_options += count;
                     for (int i = 0; i < count; ++i) {
-                        uint32_t code = BufferIO::Read<int32_t>(pbuf);  // code
-                        uint8_t ctrl = BufferIO::Read<uint8_t>(pbuf);  // controler
-                        uint8_t loc = BufferIO::Read<uint8_t>(pbuf);  // location
-                        uint8_t seq = BufferIO::Read<uint8_t>(pbuf);  // sequence
-                        uint8_t diratt = BufferIO::Read<uint8_t>(pbuf);  // direct_attackable
+                        BufferIO::Read<int32_t>(pbuf);  // code
+                        BufferIO::Read<uint8_t>(pbuf);  // controler
+                        BufferIO::Read<uint8_t>(pbuf);  // location
+                        BufferIO::Read<uint8_t>(pbuf);  // sequence
+                        BufferIO::Read<uint8_t>(pbuf);  // direct_attackable
                     }
 
                     uint8_t to_m2 = BufferIO::Read<uint8_t>(pbuf);

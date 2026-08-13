@@ -12,7 +12,6 @@ make
 ./ygocli server [--port N] [--bind ip]       # standalone duel server
 ./ygocli mcp                                 # MCP server (JSON-RPC over stdio)
 ./ygocli interact                            # interactive mode (same engine as MCP)
-./ygocli --mcp                               # alias of mcp
 ./ygocli                                     # usage help
 ```
 
@@ -34,8 +33,6 @@ Data folders (relative to the binary): `cards.cdb`, `strings.conf`, `script/`, `
 | `ygo_server` / `ygo_server_exit` | Launch / stop a `ygocli server` child process. |
 | `ygo_windbot` / `ygo_windbot_exit` | Launch / stop a WindBot AI client (`mono WindBot/WindBot.exe` — not bundled; errors until placed in `WindBot/`). |
 | `ygo_puzzle` | Play a puzzle from `single/`: `single/<puzzle>/{deck0.ydk,deck1.ydk,setup.lua}`. The optional `setup.lua` runs in the duel's lua context before the game starts (e.g. `Duel.SetLP(1, 100)`). |
-
-Deprecated aliases kept for compatibility: `ygo_single_mode` (= `ygo_solo`), `ygo_card_search` (= `ygo_card`).
 
 ### Network protocol notes
 
