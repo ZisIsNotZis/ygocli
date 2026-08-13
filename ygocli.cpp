@@ -22,6 +22,12 @@
 #include <cctype>
 #include <unistd.h>
 #include <climits>
+#include <glob.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <poll.h>
 
 // JSON (nlohmann/json)
 #include <nlohmann/json.hpp>
@@ -538,6 +544,19 @@ std::vector<uint8_t> net_response_buf;
 int net_client_fd = -1;          // socket to the server
 int net_client_seat = 0;         // our seat (0 or 1)
 bool net_client_connected = false;
+
+// Deck codes uploaded to the server (re-uploaded verbatim during match
+// side-deck phases; a future ygo_side tool can replace them between games).
+static std::vector<uint32_t> cli_deck_codes;
+
+// Path of the running binary (set in main), used to re-exec for ygo_server /
+// ygo_windbot helpers and to locate wiki/, single/, replay/, WindBot/.
+static std::string g_exe_dir;
+static std::string g_exe_path;
+
+// Child processes managed by the MCP tools (ygo_server / ygo_windbot).
+static pid_t g_server_pid = -1;
+static pid_t g_windbot_pid = -1;
 
 // Important-card tracking: (round, code) mentioned in narration.
 std::deque<std::pair<int, uint32_t>> mcp_important_cards;
@@ -2411,12 +2430,13 @@ static void mcp_setup_engine() {
     set_script_reader([](const char* script_name, int* len) -> byte* {
         std::string requested = script_name ? script_name : "";
         std::string path;
-        if (requested.rfind("./script/", 0) == 0) {
-            path = requested;
+        if (!requested.empty() && (requested[0] == '/' || requested.rfind("./", 0) == 0
+                                   || requested.rfind("../", 0) == 0)) {
+            path = requested;            // absolute / explicit relative paths pass through
         } else if (requested.rfind("script/", 0) == 0) {
             path = "./" + requested;
         } else {
-            path = "./script/" + requested;
+            path = "./script/" + requested;   // bare names resolve against script/
         }
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
@@ -2490,6 +2510,61 @@ static bool mcp_init_duel(const std::string& deck0_path, const std::string& deck
         }
     }
 
+    start_duel(pduel, DUEL_SIMPLE_AI | ((uint32_t)rule << 16));
+    mcp_engine_buffer.resize(SIZE_MESSAGE_BUFFER);
+    mcp_reset_game_state();
+    return true;
+}
+
+// Same as mcp_init_duel, but runs an optional setup.lua in the duel's lua
+// context between deck creation and start_duel (puzzle support). The script
+// can call Duel.* helpers (e.g. Duel.SetLP(1, 100)) to build a puzzle state.
+static bool mcp_init_duel_setup(const std::string& deck0_path, const std::string& deck1_path,
+                                int start_lp, int start_hand, int draw_count, int rule,
+                                const std::string& setup_lua) {
+    if (global_pduel != 0) {
+        end_duel(global_pduel);
+        global_pduel = 0;
+        last_successful_msg.clear();
+        last_successful_msg_length = 0;
+        last_response_type = RESPONSE_NONE;
+        last_response_b.clear();
+        last_response_b_length = 0;
+    }
+    Deck decks[2];
+    decks[0] = load_deck(deck0_path);
+    decks[1] = load_deck(deck1_path);
+    if (decks[0].main.empty() || decks[1].main.empty()) return false;
+    std::mt19937 rng_shuffle;
+    std::random_device rd_shuffle;
+    rng_shuffle.seed(rd_shuffle());
+    for (int i = 0; i < 2; i++) {
+        std::shuffle(decks[i].main.begin(), decks[i].main.end(), rng_shuffle);
+        std::shuffle(decks[i].extra.begin(), decks[i].extra.end(), rng_shuffle);
+    }
+    uint32_t seed[SEED_COUNT];
+    std::random_device rd;
+    for (int i = 0; i < SEED_COUNT; i++) seed[i] = rd();
+    mcp_setup_engine();
+    intptr_t pduel = create_duel_v2(seed);
+    global_pduel = pduel;
+    set_player_info(pduel, 0, start_lp, start_hand, draw_count);
+    set_player_info(pduel, 1, start_lp, start_hand, draw_count);
+    for (int i = 0; i < 2; i++) {
+        for (size_t j = 0; j < decks[i].main.size(); j++) {
+            new_card(pduel, decks[i].main[j], i, i, LOCATION_DECK, decks[i].main.size() - 1 - j, POS_FACEDOWN_DEFENSE);
+        }
+        for (size_t j = 0; j < decks[i].extra.size(); j++) {
+            new_card(pduel, decks[i].extra[j], i, i, LOCATION_EXTRA, j, POS_FACEDOWN_DEFENSE);
+        }
+    }
+    if (!setup_lua.empty()) {
+        if (preload_script(pduel, setup_lua.c_str()) == OPERATION_FAIL) {
+            char log_buf[2048] = {};
+            get_log_message(pduel, log_buf);
+            fprintf(stderr, "puzzle setup script failed: %s (%s)\n", setup_lua.c_str(), log_buf);
+        }
+    }
     start_duel(pduel, DUEL_SIMPLE_AI | ((uint32_t)rule << 16));
     mcp_engine_buffer.resize(SIZE_MESSAGE_BUFFER);
     mcp_reset_game_state();
@@ -2602,6 +2677,402 @@ static std::string mcp_tool_ygo_choose(const nlohmann::json& params) {
 }
 
 // JSON-RPC 2.0 server loop (stdin/stdout line-based)
+// ============================================================
+// Tool registry: single source of truth for tools/list, tools/call, and the
+// interactive CLI (ygocli interact). Keep tool metadata here; handlers live
+// near their dependencies (network-client tools below, solo tools above).
+// ============================================================
+
+struct ToolDef {
+    const char* name;
+    const char* description;
+    nlohmann::json schema;      // inputSchema: {type:object, properties:{...}}
+    std::string (*fn)(const nlohmann::json&);
+};
+
+// Compact input-schema builder: props = { {name, json-type, description}, ... }
+static nlohmann::json tool_schema(std::initializer_list<std::array<const char*, 3>> props) {
+    nlohmann::json p = nlohmann::json::object();
+    for (const auto& a : props) p[a[0]] = {{"type", a[1]}, {"description", a[2]}};
+    nlohmann::json s;
+    s["type"] = "object";
+    s["properties"] = p;
+    return s;
+}
+
+// Forward declarations (handlers defined near their dependencies).
+static std::string mcp_tool_ygo_client(const nlohmann::json& params);
+static std::string mcp_tool_ygo_choose(const nlohmann::json& params);
+static std::string mcp_tool_ygo_single_mode(const nlohmann::json& params);
+static std::string mcp_tool_card_search(const nlohmann::json& params);
+static std::string mcp_tool_ygo_exit(const nlohmann::json& params);
+static std::string mcp_tool_ygo_surrender(const nlohmann::json& params);
+static std::string mcp_tool_ygo_observe(const nlohmann::json& params);
+static std::string mcp_tool_ygo_replay(const nlohmann::json& params);
+static std::string mcp_tool_ygo_puzzle(const nlohmann::json& params);
+static std::string mcp_tool_ygo_wiki(const nlohmann::json& params);
+static std::string mcp_tool_ygo_server(const nlohmann::json& params);
+static std::string mcp_tool_ygo_server_exit(const nlohmann::json& params);
+static std::string mcp_tool_ygo_windbot(const nlohmann::json& params);
+static std::string mcp_tool_ygo_windbot_exit(const nlohmann::json& params);
+
+static const std::vector<ToolDef>& tools_registry() {
+    static const std::vector<ToolDef> tools = {
+        {"ygo_solo",
+         "Start a solo duel in-process (no server): both players driven from this session, "
+         "unfiltered god view. Runs until a choice is needed; respond with ygo_choose.",
+         tool_schema({{"deck0", "string", "Path to deck0 .ydk file"},
+                      {"deck1", "string", "Path to deck1 .ydk file"},
+                      {"lp", "integer", "Starting LP (default 8000)"},
+                      {"start_hand", "integer", "Starting hand size (default 5)"},
+                      {"draw_count", "integer", "Cards drawn per turn (default 1)"},
+                      {"rule", "integer", "Master rule version"}}),
+         mcp_tool_ygo_single_mode},
+        {"ygo_single_mode",
+         "Deprecated alias of ygo_solo (kept for compatibility).",
+         tool_schema({{"deck0", "string", "Path to deck0 .ydk file"},
+                      {"deck1", "string", "Path to deck1 .ydk file"}}),
+         mcp_tool_ygo_single_mode},
+        {"ygo_client",
+         "Connect to a ygocli/gframe server as a player. First call joins the room, uploads "
+         "your deck and becomes Ready; the host auto-starts once both players are in. "
+         "Subsequent calls return the next view/prompt; use ygo_choose to respond. On failure "
+         "(connection refused, room full, deck rejected, version mismatch, game already "
+         "started) returns an error and closes the connection. mode=1 (default) plays a "
+         "best-of-3 match with side-deck exchange; mode=0 is a single game.",
+         tool_schema({{"host", "string", "Server host (default 127.0.0.1)"},
+                      {"port", "integer", "Server port (default 7911)"},
+                      {"password", "string", "Room password (host sets it when creating; joiner must match)"},
+                      {"create_game", "boolean", "true to create the room as host"},
+                      {"deck", "array", "Your deck: path to a .ydk file, or array of card codes"},
+                      {"name", "string", "Player name"},
+                      {"lp", "integer", "Starting LP (host, default 8000)"},
+                      {"start_hand", "integer", "Starting hand (host, default 5)"},
+                      {"draw_count", "integer", "Draws per turn (host, default 1)"},
+                      {"rule", "integer", "Master rule (host, default 5)"},
+                      {"mode", "integer", "0 = single game, 1 = best-of-3 match (host, default 1)"}}),
+         mcp_tool_ygo_client},
+        {"ygo_choose",
+         "Choose an option from the pending prompt and continue the duel (solo or network).",
+         tool_schema({{"id", "integer", "The choice index to select (or -1 to pass)"},
+                      {"indices", "array", "For multi-select prompts, ordered list of indices"}}),
+         mcp_tool_ygo_choose},
+        {"ygo_card",
+         "Search the card database by any combination of filters (AND). Usable in-game or out.",
+         tool_schema({{"id", "integer", "Exact card code"},
+                      {"text", "string", "Words that must appear in name/desc"},
+                      {"level", "string", "Level filter, e.g. 4, >4, <=8"},
+                      {"atk", "string", "ATK filter, e.g. >2500"},
+                      {"def", "string", "DEF filter"},
+                      {"type", "string", "Type filter, e.g. Monster|Effect|Xyz"},
+                      {"race", "string", "Race filter, e.g. Dragon|Machine"},
+                      {"attribute", "string", "Attribute filter, e.g. Fire|Light"}}),
+         mcp_tool_card_search},
+        {"ygo_card_search",
+         "Deprecated alias of ygo_card (kept for compatibility).",
+         tool_schema({{"text", "string", "Words that must appear in name/desc"}}),
+         mcp_tool_card_search},
+        {"ygo_wiki",
+         "Search the bundled wiki (wiki/ folder of small markdown files) for concepts. "
+         "Returns the content of matching files. Usable in-game or out.",
+         tool_schema({{"text", "string", "Concept to search for (empty lists all topics)"}}),
+         mcp_tool_ygo_wiki},
+        {"ygo_exit",
+         "Close the current network connection (leave the room).",
+         tool_schema({}),
+         mcp_tool_ygo_exit},
+        {"ygo_surrender",
+         "Surrender the current game. Unlike ygo_exit the connection stays up: in a match "
+         "the opponent wins the game, players exchange side decks, and the next game starts.",
+         tool_schema({}),
+         mcp_tool_ygo_surrender},
+        {"ygo_observe",
+         "Connect to a ygocli/gframe server as an observer: sees both players' public "
+         "information but is never asked for choices.",
+         tool_schema({{"host", "string", "Server host (default 127.0.0.1)"},
+                      {"port", "integer", "Server port (default 7911)"},
+                      {"password", "string", "Room password"}}),
+         mcp_tool_ygo_observe},
+        {"ygo_replay",
+         "Play back a saved replay file (.yrp). Returns a narration + final field state. "
+         "Replays are auto-saved by the server to replay/YYYYMMDD_HHMMSS.yrp.",
+         tool_schema({{"file", "string", "Path to the .yrp replay file"}}),
+         mcp_tool_ygo_replay},
+        {"ygo_server",
+         "Launch a ygocli server for you (same as running `ygocli server`). The server "
+         "runs as a child process; stop it with ygo_server_exit.",
+         tool_schema({{"port", "integer", "Listen port (default 7911)"},
+                      {"bind", "string", "Bind address (default 0.0.0.0)"}}),
+         mcp_tool_ygo_server},
+        {"ygo_server_exit",
+         "Stop the server launched by ygo_server (if any).",
+         tool_schema({}),
+         mcp_tool_ygo_server_exit},
+        {"ygo_windbot",
+         "Launch a WindBot AI client (mono WindBot/WindBot.exe) that connects to a server "
+         "and plays autonomously. WindBot is not bundled: returns an error until WindBot.exe "
+         "is placed in the WindBot/ directory.",
+         tool_schema({{"host", "string", "Server host (default 127.0.0.1)"},
+                      {"port", "integer", "Server port (default 7911)"},
+                      {"name", "string", "Bot player name"},
+                      {"deck", "string", "Path to the bot's .ydk deck"}}),
+         mcp_tool_ygo_windbot},
+        {"ygo_windbot_exit",
+         "Stop the WindBot launched by ygo_windbot (if any).",
+         tool_schema({}),
+         mcp_tool_ygo_windbot_exit},
+        {"ygo_puzzle",
+         "Play a puzzle from the single/ folder (like ocgcore/gframe single mode): "
+         "single/<puzzle>/deck0.ydk, deck1.ydk, optional setup.lua (runs in the duel's lua "
+         "context, e.g. Duel.SetLP). Falls back to explicit deck0/deck1 params. Respond with "
+         "ygo_choose.",
+         tool_schema({{"puzzle", "string", "Puzzle name -> single/<puzzle>/ decks"},
+                      {"deck0", "string", "Fallback deck0 path (if no puzzle name)"},
+                      {"deck1", "string", "Fallback deck1 path"},
+                      {"lp", "integer", "Starting LP (default 8000)"},
+                      {"start_hand", "integer", "Starting hand size (default 5)"},
+                      {"draw_count", "integer", "Draws per turn (default 1)"}}),
+         mcp_tool_ygo_puzzle},
+    };
+    return tools;
+}
+
+// ---------------------------------------------------------------------------
+// FUTURE (not implemented, do NOT register): ygo_snapshot
+//   Snapshot the current game state into a ygo_puzzle format (single/ folder):
+//   export decks, LP, hand/field/grave/removed contents per player, turn/phase,
+//   and the win condition, as a puzzle that ygo_puzzle can reload.
+//   Hard parts: expressing arbitrary state (counters, markers, chain state,
+//   xyz materials, pending effects) in a script-based puzzle format. The puzzle
+//   loader (mcp_init_duel_setup) already runs a setup.lua in the duel's lua
+//   context (Duel.SetLP etc.), so a snapshot can be emitted as a setup.lua +
+//   two decks. Where the ocgcore lua API lacks the needed helpers (e.g. placing
+//   a specific card in a zone with materials), the plan is to fork ocgcore and
+//   add new Duel.* functions so arbitrary states are expressible.
+//   Do not expose in tools/list until implemented.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ygo_wiki: grep-based search over wiki/*.md concept files.
+// ---------------------------------------------------------------------------
+static std::string mcp_tool_ygo_wiki(const nlohmann::json& params) {
+    std::string text = params.value("text", "");
+    std::vector<std::string> files;
+    glob_t g;
+    std::string pat = g_exe_dir + "/wiki/*.md";
+    if (::glob(pat.c_str(), 0, nullptr, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; ++i) files.push_back(g.gl_pathv[i]);
+        globfree(&g);
+    }
+    if (files.empty()) return "wiki/ folder is empty or missing (looked in " + pat + ")";
+    std::sort(files.begin(), files.end());
+
+    if (text.empty()) {
+        std::ostringstream out;
+        out << "wiki/ topics (" << files.size() << "):\n";
+        for (auto& f : files) {
+            size_t s = f.find_last_of('/');
+            out << "  " << f.substr(s + 1) << "\n";
+        }
+        out << "\nCall ygo_wiki with a text to see matching files.";
+        return out.str();
+    }
+
+    std::string lower;
+    for (char c : text) lower += (char)std::tolower((unsigned char)c);
+
+    std::ostringstream out;
+    int shown = 0;
+    for (auto& f : files) {
+        std::ifstream in(f);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        std::string content = ss.str();
+        std::string cl = content;
+        for (auto& c : cl) c = (char)std::tolower((unsigned char)c);
+        if (cl.find(lower) == std::string::npos) continue;
+        size_t s = f.find_last_of('/');
+        out << "===== " << f.substr(s + 1) << " =====\n" << content << "\n\n";
+        if (++shown >= 3) { out << "(more matches omitted; refine your search)\n"; break; }
+    }
+    if (shown == 0) return "No wiki file mentions '" + text + "'. Try ygo_wiki with no text to list topics.";
+    return out.str();
+}
+
+// ---------------------------------------------------------------------------
+// ygo_server / ygo_server_exit: manage a child `ygocli server` process.
+// ---------------------------------------------------------------------------
+static std::string mcp_tool_ygo_server(const nlohmann::json& params) {
+    if (g_server_pid > 0) {
+        return "Error: a ygocli server is already running (pid " + std::to_string(g_server_pid)
+               + "); call ygo_server_exit first";
+    }
+    int port = params.value("port", 7911);
+    std::string bind = params.value("bind", "0.0.0.0");
+    pid_t pid = fork();
+    if (pid < 0) return "Error: fork failed";
+    if (pid == 0) {
+        int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); }
+        execl(g_exe_path.c_str(), "ygocli", "server", "--port",
+              std::to_string(port).c_str(), "--bind", bind.c_str(), (char*)nullptr);
+        _exit(1);
+    }
+    g_server_pid = pid;
+    return "ygocli server launched on " + bind + ":" + std::to_string(port)
+           + " (pid " + std::to_string(pid) + ")";
+}
+
+static std::string mcp_tool_ygo_server_exit(const nlohmann::json&) {
+    if (g_server_pid <= 0) return "No ygocli server running";
+    ::kill(g_server_pid, SIGTERM);
+    int st = 0;
+    waitpid(g_server_pid, &st, 0);
+    g_server_pid = -1;
+    return "server stopped";
+}
+
+// ---------------------------------------------------------------------------
+// ygo_windbot / ygo_windbot_exit: manage a WindBot child (mono WindBot/WindBot.exe).
+// WindBot is NOT bundled; the tool errors out until WindBot.exe exists.
+// ---------------------------------------------------------------------------
+static std::string mcp_tool_ygo_windbot(const nlohmann::json& params) {
+    if (g_windbot_pid > 0) {
+        return "Error: a WindBot is already running (pid " + std::to_string(g_windbot_pid)
+               + "); call ygo_windbot_exit first";
+    }
+    std::string exe = g_exe_dir + "/WindBot/WindBot.exe";
+    if (::access(exe.c_str(), R_OK) != 0) {
+        return "Error: WindBot not installed (expected " + exe
+               + "). Place WindBot.exe there and retry.";
+    }
+    std::string host = params.value("host", "127.0.0.1");
+    int port = params.value("port", 7911);
+    std::string name = params.value("name", "WindBot");
+    std::string deck = params.value("deck", "");
+    pid_t pid = fork();
+    if (pid < 0) return "Error: fork failed";
+    if (pid == 0) {
+        int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); }
+        if (!deck.empty()) {
+            execl("/usr/bin/mono", "mono", exe.c_str(), host.c_str(),
+                  std::to_string(port).c_str(), name.c_str(), deck.c_str(), (char*)nullptr);
+        } else {
+            execl("/usr/bin/mono", "mono", exe.c_str(), host.c_str(),
+                  std::to_string(port).c_str(), name.c_str(), (char*)nullptr);
+        }
+        _exit(1);
+    }
+    g_windbot_pid = pid;
+    return "WindBot launched (pid " + std::to_string(pid) + "): " + host + ":" + std::to_string(port);
+}
+
+static std::string mcp_tool_ygo_windbot_exit(const nlohmann::json&) {
+    if (g_windbot_pid <= 0) return "No WindBot running";
+    ::kill(g_windbot_pid, SIGTERM);
+    int st = 0;
+    waitpid(g_windbot_pid, &st, 0);
+    g_windbot_pid = -1;
+    return "WindBot stopped";
+}
+
+// ---------------------------------------------------------------------------
+// ygo_puzzle: single/ folder puzzle (decks + optional setup.lua) played solo.
+// ---------------------------------------------------------------------------
+static std::string mcp_tool_ygo_puzzle(const nlohmann::json& params) {
+    std::string deck0 = params.value("deck0", "");
+    std::string deck1 = params.value("deck1", "");
+    std::string puzzle = params.value("puzzle", "");
+    std::string setup_lua;
+    if (!puzzle.empty()) {
+        std::string base = g_exe_dir + "/single/" + puzzle;
+        if (deck0.empty()) deck0 = base + "/deck0.ydk";
+        if (deck1.empty()) deck1 = base + "/deck1.ydk";
+        setup_lua = base + "/setup.lua";
+        if (::access(setup_lua.c_str(), R_OK) != 0) setup_lua.clear();
+    }
+    int lp = params.value("lp", 8000);
+    int start_hand = params.value("start_hand", 5);
+    int draw_count = params.value("draw_count", 1);
+    int rule = params.value("rule", CURRENT_RULE);
+
+    if (!mcp_init_duel_setup(deck0, deck1, lp, start_hand, draw_count, rule, setup_lua)) {
+        return "Error: failed to load puzzle (deck0=" + deck0 + " deck1=" + deck1 + ")";
+    }
+    mcp_begin_capture();
+    int ret = mcp_run_until_pause();
+    std::string narration = mcp_take_capture();
+    mcp_end_capture();
+    if (ret == 1) {
+        std::string result = mcp_format_output(narration, "");
+        result += "Game Over: Player " + std::to_string(mcp_winner) + " wins!";
+        end_duel(global_pduel);
+        global_pduel = 0;
+        return result;
+    }
+    if (ret == -1) return "Error: Game not started";
+    std::string choices = mcp_build_choices();
+    return mcp_format_output(narration, choices);
+}
+
+// ---------------------------------------------------------------------------
+// ygocli interact: same engine as MCP, but a human picks the tool and fills
+// each field interactively. Output format is identical to tools/call.
+// ---------------------------------------------------------------------------
+static void mcp_interact_loop() {
+    auto print_help = []() {
+        std::cout << "Available tools:\n";
+        for (const auto& t : tools_registry()) std::cout << "  " << t.name << "\n";
+        std::cout << "Type a tool name, 'help', or 'quit'.\n";
+    };
+    std::cout << "ygocli interactive mode (same engine as MCP, human-friendly input)\n";
+    print_help();
+    std::string line;
+    while (true) {
+        std::cout << "\nygocli> " << std::flush;
+        if (!std::getline(std::cin, line)) break;
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) line.pop_back();
+        if (line.empty()) continue;
+        if (line == "quit" || line == "exit" || line == "q") break;
+        if (line == "help" || line == "?") { print_help(); continue; }
+        const ToolDef* tool = nullptr;
+        for (const auto& t : tools_registry()) if (line == t.name) { tool = &t; break; }
+        if (!tool) { std::cout << "Unknown tool '" << line << "'. Type 'help'.\n"; continue; }
+
+        nlohmann::json args = nlohmann::json::object();
+        auto props = tool->schema.value("properties", nlohmann::json::object());
+        for (auto it = props.begin(); it != props.end(); ++it) {
+            std::string type = it.value().value("type", "string");
+            std::cout << "  " << it.key() << " (" << type << ") - "
+                      << it.value().value("description", "") << " [empty=skip]: " << std::flush;
+            std::string val;
+            if (!std::getline(std::cin, val)) break;
+            while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r')) val.pop_back();
+            if (val.empty()) continue;
+            if (type == "integer") {
+                args[it.key()] = (nlohmann::json::number_integer_t)std::strtoll(val.c_str(), nullptr, 10);
+            } else if (type == "boolean") {
+                args[it.key()] = (val == "true" || val == "1" || val == "yes" || val == "y");
+            } else if (type == "array") {
+                nlohmann::json arr = nlohmann::json::array();
+                std::string tok;
+                std::stringstream ss(val);
+                while (std::getline(ss, tok, ',')) {
+                    if (!tok.empty()) arr.push_back(tok);
+                }
+                args[it.key()] = arr;
+            } else {
+                args[it.key()] = val;
+            }
+        }
+        std::cout << "----------------------------\n";
+        std::cout << tool->fn(args) << "\n";
+        std::cout.flush();
+    }
+}
+
+// JSON-RPC 2.0 server loop (stdin/stdout line-based), MCP-compatible.
 static void mcp_jsonrpc_loop() {
     std::string line;
     while (true) {
@@ -2631,7 +3102,6 @@ static void mcp_jsonrpc_loop() {
         std::string error_msg;
 
         if (method == "initialize") {
-            // Echo the client's requested protocol version (MCP negotiation).
             nlohmann::json init_params = req.value("params", nlohmann::json::object());
             std::string pv = init_params.value("protocolVersion", "2024-11-05");
             resp["result"] = {
@@ -2641,66 +3111,9 @@ static void mcp_jsonrpc_loop() {
             };
         } else if (method == "tools/list") {
             nlohmann::json tools = nlohmann::json::array();
-            tools.push_back({
-                {"name", "ygo_single_mode"},
-                {"description", "Start a solo duel in-process: both players are driven from this session (unfiltered god view). Runs until a choice is needed."},
-                {"inputSchema", {
-                    {"type", "object"},
-                    {"properties", {
-                        {"deck0", {{"type", "string"}, {"description", "Path to deck0 .ydk file"}}},
-                        {"deck1", {{"type", "string"}, {"description", "Path to deck1 .ydk file"}}},
-                        {"lp", {{"type", "integer"}, {"description", "Starting LP (default 8000)"}}},
-                        {"start_hand", {{"type", "integer"}, {"description", "Starting hand size (default 5)"}}},
-                        {"draw_count", {{"type", "integer"}, {"description", "Cards drawn per turn (default 1)"}}},
-                        {"rule", {{"type", "integer"}, {"description", "Master rule version"}}}
-                    }},
-                    {"required", {"deck0", "deck1"}}
-                }}
-            });
-            tools.push_back({
-                {"name", "ygo_client"},
-                {"description", "Connect to a ygocli/gframe server as a player. First call joins and uploads your deck; subsequent calls return the next view/prompt. Use ygo_choose to respond. Each side sees only its own filtered view."},
-                {"inputSchema", {
-                    {"type", "object"},
-                    {"properties", {
-                        {"host", {{"type", "string"}, {"description", "Server host (default 127.0.0.1)"}}},
-                        {"port", {{"type", "integer"}, {"description", "Server port (default 7911)"}}},
-                        {"create_game", {{"type", "boolean"}, {"description", "true to create a new game as host (first call)"}}},
-                        {"deck", {{"type", "string"}, {"description", "Path to your .ydk deck"}}},
-                        {"name", {{"type", "string"}, {"description", "Player name"}}},
-                        {"lp", {{"type", "integer"}, {"description", "Starting LP (host, default 8000)"}}},
-                        {"start_hand", {{"type", "integer"}, {"description", "Starting hand (host, default 5)"}}},
-                        {"draw_count", {{"type", "integer"}, {"description", "Draws per turn (host, default 1)"}}},
-                        {"rule", {{"type", "integer"}, {"description", "Master rule (host, default 5)"}}}
-                    }}
-                }}
-            });
-            tools.push_back({
-                {"name", "ygo_choose"},
-                {"description", "Choose an option from the pending prompt and continue the duel (solo or network)."},
-                {"inputSchema", {
-                    {"type", "object"},
-                    {"properties", {
-                        {"id", {{"type", "integer"}, {"description", "The choice index to select"}}},
-                        {"indices", {{"type", "array"}, {"items", {{"type", "integer"}}},
-                                     {"description", "For multi-select prompts, list of indices"}}}
-                    }},
-                    {"required", nlohmann::json::array()}
-                }}
-            });
-            tools.push_back({
-                {"name", "ygo_card_search"},
-                {"description", "Search card database. AND across all params."},
-                {"inputSchema", {
-                    {"type", "object"},
-                    {"properties", {
-                        {"id", {{"type", "integer"}}}, {"text", {{"type", "string"}}},
-                        {"level", {{"type", "string"}}}, {"atk", {{"type", "string"}}},
-                        {"def", {{"type", "string"}}}, {"type", {{"type", "string"}}},
-                        {"race", {{"type", "string"}}}, {"attribute", {{"type", "string"}}}
-                    }}
-                }}
-            });
+            for (const auto& t : tools_registry()) {
+                tools.push_back({{"name", t.name}, {"description", t.description}, {"inputSchema", t.schema}});
+            }
             resp["result"]["tools"] = tools;
         } else if (method == "tools/call") {
             nlohmann::json params = req.value("params", nlohmann::json::object());
@@ -2709,17 +3122,13 @@ static void mcp_jsonrpc_loop() {
             if (!args.is_object()) args = nlohmann::json::object();
 
             std::string tool_result;
-            if (tool_name == "ygo_single_mode") {
-                tool_result = mcp_tool_ygo_single_mode(args);
-            } else if (tool_name == "ygo_client") {
-                tool_result = mcp_tool_ygo_client(args);
-            } else if (tool_name == "ygo_choose") {
-                tool_result = mcp_tool_ygo_choose(args);
-            } else if (tool_name == "ygo_card_search") {
-                tool_result = mcp_tool_card_search(args);
-            } else {
+            const ToolDef* tool = nullptr;
+            for (const auto& t : tools_registry()) if (tool_name == t.name) { tool = &t; break; }
+            if (!tool) {
                 error_code = -32601;
                 error_msg = "Unknown tool: " + tool_name;
+            } else {
+                tool_result = tool->fn(args);
             }
             if (error_code == 0) {
                 resp["result"] = {{"content", {{{"type", "text"}, {"text", tool_result}}}}};
@@ -2757,7 +3166,9 @@ struct ServerPlayer {
     uint16_t name[20] = {};
 };
 
-static ServerPlayer srv_players[2];
+static ServerPlayer srv_players[2 + 6];   // seats 0-1: players; seats 2-7: observers
+static constexpr int SRV_PLAYER_SEATS = 2;
+static constexpr int SRV_MAX_SEATS = 8;
 static int srv_listen_fd = -1;
 static HostInfo srv_host_info;
 static bool srv_started = false;
@@ -2767,16 +3178,63 @@ static int srv_tp_player = 0;      // seat that picks turn after RPS
 static int srv_duel_stage = 0;
 static uint8_t srv_hand_result[2] = {0, 0};
 
+// Match state: best-of-3 with side-deck exchange (HostInfo.mode == 1).
+static bool srv_match_mode = false;
+static int srv_match_wins[2] = {0, 0};
+static int srv_last_winner = -1;        // winner of the finished game (0/1), -1 if abort
+static int srv_surrender_winner = -1;   // set when a player surrenders
+static std::string srv_room_pass;       // host-set room password (empty = none)
+
+// Replay capture: raw [u32 len][bytes] chunks of the engine message stream
+// for the current game; saved to replay/YYYYMMDD_HHMMSS.yrp at game end.
+static std::vector<uint8_t> srv_replay_data;
+static uint32_t srv_replay_seed[SEED_COUNT] = {};
+static void srv_replay_add(const uint8_t* data, size_t len) {
+    if (!data || len == 0) return;
+    uint32_t l = (uint32_t)len;
+    uint8_t b[4];
+    std::memcpy(b, &l, 4);
+    srv_replay_data.insert(srv_replay_data.end(), b, b + 4);
+    srv_replay_data.insert(srv_replay_data.end(), data, data + len);
+}
+static void srv_save_replay(int game_index) {
+    if (srv_replay_data.empty()) return;
+    std::string dir = g_exe_dir + "/replay";
+    mkdir(dir.c_str(), 0755);
+    time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char name[64];
+    strftime(name, sizeof name, "%Y%m%d_%H%M%S", &tmv);
+    std::string path = dir + "/" + name + (game_index > 1 ? "_g" + std::to_string(game_index) : "") + ".yrp";
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "replay: cannot write %s\n", path.c_str()); return; }
+    fwrite("ygopro", 1, 6, f);
+    uint32_t version = 0x12d0;
+    fwrite(&version, 4, 1, f);
+    fwrite(srv_replay_seed, 4, SEED_COUNT, f);
+    fwrite(srv_replay_data.data(), 1, srv_replay_data.size(), f);
+    fclose(f);
+    fprintf(stderr, "replay saved: %s (%zu bytes)\n", path.c_str(), srv_replay_data.size());
+}
+
 static void srv_send(int seat, uint8_t proto, const uint8_t* data, size_t len) {
-    if (seat < 0 || seat > 1 || srv_players[seat].fd < 0) return;
+    if (seat < 0 || seat >= SRV_MAX_SEATS || srv_players[seat].fd < 0) return;
     net::write_packet(srv_players[seat].fd, proto, data, len);
 }
 static void srv_send_msg(int seat, const uint8_t* offset, const uint8_t* pbuf) {
     srv_send(seat, STOC_GAME_MSG, offset, (size_t)(pbuf - offset));
 }
+// Broadcast a message to every observer seat (public view).
+static void srv_send_obs(const uint8_t* offset, const uint8_t* pbuf) {
+    for (int s = SRV_PLAYER_SEATS; s < SRV_MAX_SEATS; ++s)
+        if (srv_players[s].fd >= 0 && srv_players[s].type == NETPLAYER_TYPE_OBSERVER)
+            srv_send_msg(s, offset, pbuf);
+}
 static void srv_send_msg_both(const uint8_t* offset, const uint8_t* pbuf) {
     srv_send_msg(0, offset, pbuf);
     srv_send_msg(1, offset, pbuf);
+    srv_send_obs(offset, pbuf);
 }
 static void srv_send_packet(int seat, uint8_t proto) {
     uint8_t msg = proto;
@@ -2824,6 +3282,7 @@ static void srv_refresh_location(int owner, uint32_t location, uint32_t flag, bo
         }
     }
     srv_send_msg(1 - owner, qbuf, q + len);
+    srv_send_obs(qbuf, q + len);   // observers see the public (hidden-omitted) view
 }
 
 static void srv_refresh_mzone(int owner) { srv_refresh_location(owner, LOCATION_MZONE, QUERY_ATTACK | QUERY_DEFENSE | QUERY_LEVEL | QUERY_RANK | QUERY_TYPE, true); }
@@ -2865,10 +3324,11 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
             break;
         }
         case MSG_WIN: {
-            BufferIO::Read<uint8_t>(pbuf); // winner
+            srv_last_winner = BufferIO::Read<uint8_t>(pbuf); // winner
             BufferIO::Read<uint8_t>(pbuf); // reason
             srv_send_msg(0, offset, pbuf);
             srv_send_msg(1, offset, pbuf);
+            srv_send_obs(offset, pbuf);
             return 2;
         }
         case MSG_SELECT_BATTLECMD: {
@@ -3075,6 +3535,7 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
             srv_send_msg(player, offset, pbuf + count * 4);
             for (int i = 0; i < count; ++i) BufferIO::Write<int32_t>(pbuf, 0);
             srv_send_msg(1 - player, offset, pbuf);
+            srv_send_obs(offset, pbuf);
             srv_refresh_hand(player);
             break;
         }
@@ -3084,6 +3545,7 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
             srv_send_msg(player, offset, pbuf + count * 4);
             for (int i = 0; i < count; ++i) BufferIO::Write<int32_t>(pbuf, 0);
             srv_send_msg(1 - player, offset, pbuf);
+            srv_send_obs(offset, pbuf);
             srv_refresh_extra(player);
             break;
         }
@@ -3150,6 +3612,7 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
                     && ((cl & (LOCATION_DECK | LOCATION_HAND)) || hide_code))
                 BufferIO::Write<int32_t>(pbufw, 0);
             srv_send_msg(1 - cc, offset, pbuf);
+            srv_send_obs(offset, pbuf);
             if (cl != 0 && (cl & LOCATION_OVERLAY) == 0 && (cl != (uint32_t)pl || pc != cc))
                 srv_refresh_location(cc, cl, QUERY_TYPE, true);
             break;
@@ -3163,8 +3626,10 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
             break;
         }
         case MSG_SET: {
+            // MSG_SET: msg(1) + code(4) + info_location(4). Zero the code for
+            // the opponent copy, consume the full 8-byte payload.
             BufferIO::Write<int32_t>(pbuf, 0);
-            pbuf += 4;
+            pbuf += 8;
             srv_send_msg_both(offset, pbuf);
             break;
         }
@@ -3204,6 +3669,7 @@ static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
             srv_send_msg(cc, offset, pbuf);
             if (hide_code) BufferIO::Write<int32_t>(pbufw, 0);
             srv_send_msg(1 - cc, offset, pbuf);
+            srv_send_obs(offset, pbuf);
             break;
         }
         case MSG_SPSUMMONED:
@@ -3382,6 +3848,7 @@ static void srv_game_loop() {
         engFlag = result & PROCESSOR_FLAG;
         if (engLen <= 0) continue;
         get_message(global_pduel, engine_buf);
+        srv_replay_add(engine_buf, (size_t)engLen);   // replay capture
         if (std::getenv("YGOCLI_MCP_DEBUG")) {
             fprintf(stderr, "srv msg 0x%02x len%d:", (int)engine_buf[0], engLen);
             for (int i = 0; i < engLen && i < 24; ++i) fprintf(stderr, " %02x", engine_buf[i]);
@@ -3389,7 +3856,7 @@ static void srv_game_loop() {
         }
         int stop = srv_analyze(engine_buf, engLen);
         if (stop == 2) break;             // duel over
-        if (stop == 1) { srv_await_response(); if (srv_duel_abort) break; continue; } // waiting for a response
+        if (stop == 1) { srv_await_response(); if (srv_duel_abort || srv_surrender_winner >= 0) break; continue; } // waiting for a response
     }
     // duel ended
     if (std::getenv("YGOCLI_MCP_DEBUG")) {
@@ -3436,38 +3903,130 @@ static void srv_send_join(int seat) {
 }
 
 // Main server: accept 2 players, handshake, then run the duel.
+// Play one game of a match: build the duel from the players' current decks and
+// drive it to completion (game 1 = after RPS+TP; games 2+ = after side phase).
+// swap=true means player 1 (seat 1) goes first. Saves a replay at game end.
+// Returns true when the game ended with a legitimate winner (not an abort).
+// Play one game of a match: build the duel from the players' current decks and
+// drive it to completion (game 1 = after RPS+TP; games 2+ = after side phase).
+// swap=true means player 1 (seat 1) goes first. Saves a replay at game end.
+// Returns true when the game ended with a legitimate winner (not an abort).
+static bool srv_play_one_game(bool swap, int game_index) {
+    Deck decks[2];
+    decks[0] = Deck{srv_players[0].deck_main, srv_players[0].deck_extra};
+    decks[1] = Deck{srv_players[1].deck_main, srv_players[1].deck_extra};
+    if (swap) std::swap(decks[0], decks[1]);
+
+    std::mt19937 rng;
+    std::random_device rd;
+    rng.seed(rd());
+    for (int i = 0; i < 2; i++) {
+        std::shuffle(decks[i].main.begin(), decks[i].main.end(), rng);
+        std::shuffle(decks[i].extra.begin(), decks[i].extra.end(), rng);
+    }
+    uint32_t seed[SEED_COUNT];
+    for (int i = 0; i < SEED_COUNT; i++) seed[i] = rd();
+    for (int i = 0; i < SEED_COUNT; i++) srv_replay_seed[i] = seed[i];
+
+    mcp_setup_engine();
+    if (global_pduel) { end_duel(global_pduel); global_pduel = 0; }
+    global_pduel = create_duel_v2(seed);
+    set_player_info(global_pduel, 0, srv_host_info.start_lp ? srv_host_info.start_lp : 8000,
+                    srv_host_info.start_hand ? srv_host_info.start_hand : 5,
+                    srv_host_info.draw_count ? srv_host_info.draw_count : 1);
+    set_player_info(global_pduel, 1, srv_host_info.start_lp ? srv_host_info.start_lp : 8000,
+                    srv_host_info.start_hand ? srv_host_info.start_hand : 5,
+                    srv_host_info.draw_count ? srv_host_info.draw_count : 1);
+    for (int i = 0; i < 2; i++) {
+        for (size_t j = 0; j < decks[i].main.size(); j++)
+            new_card(global_pduel, decks[i].main[j], i, i, LOCATION_DECK, decks[i].main.size() - 1 - j, POS_FACEDOWN_DEFENSE);
+        for (size_t j = 0; j < decks[i].extra.size(); j++)
+            new_card(global_pduel, decks[i].extra[j], i, i, LOCATION_EXTRA, j, POS_FACEDOWN_DEFENSE);
+    }
+    int rule = srv_host_info.duel_rule ? srv_host_info.duel_rule : CURRENT_RULE;
+    // MSG_START (hand-built, per gframe)
+    uint8_t startbuf[32]{};
+    uint8_t* sp = startbuf;
+    BufferIO::Write<uint8_t>(sp, MSG_START);
+    BufferIO::Write<uint8_t>(sp, 0);
+    BufferIO::Write<uint8_t>(sp, (uint8_t)rule);
+    BufferIO::Write<int32_t>(sp, srv_host_info.start_lp ? srv_host_info.start_lp : 8000);
+    BufferIO::Write<int32_t>(sp, srv_host_info.start_lp ? srv_host_info.start_lp : 8000);
+    BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 0, LOCATION_DECK));
+    BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 0, LOCATION_EXTRA));
+    BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 1, LOCATION_DECK));
+    BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 1, LOCATION_EXTRA));
+    int seat0_first = swap ? 1 : 0;
+    srv_replay_data.clear();
+    srv_replay_add(startbuf, 19);          // replay chunk 0 = MSG_START (player 0 copy)
+    srv_send(seat0_first, STOC_GAME_MSG, startbuf, 19);
+    startbuf[1] = 1;
+    srv_send(1 - seat0_first, STOC_GAME_MSG, startbuf, 19);
+    srv_refresh_extra(0);
+    srv_refresh_extra(1);
+    uint32_t opt = (uint32_t)rule << 16;
+    start_duel(global_pduel, opt);
+    srv_game_loop();
+    // game over (win, surrender, or abort)
+    srv_duel_stage = DUEL_STAGE_END;
+    if (global_pduel) { end_duel(global_pduel); global_pduel = 0; }
+    srv_save_replay(game_index);
+    bool ok = !srv_duel_abort && srv_last_winner >= 0;
+    srv_surrender_winner = -1;
+    return ok;
+}
+
 static int run_server(const std::string& bind_ip, uint16_t port) {
     srv_listen_fd = net::listen(bind_ip, port);
     if (srv_listen_fd < 0) { fprintf(stderr, "server: cannot listen on %s:%u\n", bind_ip.c_str(), (unsigned)port); return 1; }
     fprintf(stderr, "ygocli server listening on %s:%u\n", bind_ip.empty() ? "0.0.0.0" : bind_ip.c_str(), (unsigned)port);
 
-    // Accept players lazily, interleaved with packet processing so a player's
-    // create/join is answered promptly instead of waiting for the 2nd seat.
+    for (int i = 0; i < SRV_MAX_SEATS; ++i) { srv_players[i] = ServerPlayer(); srv_players[i].type = 0xff; }
     bool host_info_received = false;
     bool deck_received[2] = {false, false};
     int host_started = 0;
+    srv_match_mode = false;
+    srv_match_wins[0] = srv_match_wins[1] = 0;
+    srv_room_pass.clear();
+    srv_duel_abort = false;
+    srv_last_winner = -1;
+    srv_surrender_winner = -1;
+    srv_started = false;
+    srv_duel_stage = DUEL_STAGE_BEGIN;
 
+    auto reject_seat = [&](int seat, uint8_t errmsg, uint32_t code) {
+        STOC_ErrorMsg err{}; err.msg = errmsg; err.code = code;
+        net::write_packet(srv_players[seat].fd, STOC_ERROR_MSG, (const uint8_t*)&err, 8);
+        net::close(srv_players[seat].fd);
+        srv_players[seat].fd = -1;
+        srv_players[seat].type = 0xff;
+        srv_players[seat].state = 0;
+        fprintf(stderr, "seat %d rejected (msg=%d)\n", seat, (int)errmsg);
+    };
+
+    // ---- Room formation: accept players (seats 0-1) and observers (2-7), ----
+    // interleaved with packet processing so create/join is answered promptly.
     while (srv_duel_stage == DUEL_STAGE_BEGIN) {
-        // Accept any pending connection into the first free seat.
-        for (int seat = 0; seat < 2; ++seat) {
+        for (int seat = 0; seat < SRV_MAX_SEATS; ++seat) {
             if (srv_players[seat].fd >= 0) continue;
             int fd = net::accept(srv_listen_fd);
             if (fd < 0) break; // no more pending right now
             srv_players[seat].fd = fd;
             srv_players[seat].type = (uint8_t)seat;
             srv_players[seat].state = 0xff;
-            fprintf(stderr, "player %d connected (seat %d)\n", seat, seat);
+            srv_players[seat].ready = false;
+            srv_players[seat].deck_main.clear();
+            srv_players[seat].deck_extra.clear();
+            srv_players[seat].deck_side.clear();
+            fprintf(stderr, "connection accepted (seat %d)\n", seat);
         }
-        // If both seats are taken and we never got to handshake them, nothing
-        // to do here; the poll loop below handles their packets.
 
-        // Non-blocking-ish poll: read whichever player has data (short timeout).
         bool any_activity = false;
-        for (int seat = 0; seat < 2; ++seat) {
+        for (int seat = 0; seat < SRV_MAX_SEATS; ++seat) {
             std::vector<uint8_t> payload;
             uint8_t pkt = 0;
             int n = srv_read_packet(seat, &pkt, payload, 50);
-            if (n < 0) continue;
+            if (n < 0) continue;   // 50ms poll timeout (or disconnect); keep the seat
             any_activity = true;
             fprintf(stderr, "srv pkt seat%d proto 0x%02x len%d state=0x%02x\n", seat, (int)pkt, n, srv_players[seat].state);
             // state gate: after joining, expect specific packet types
@@ -3477,10 +4036,16 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
                 std::memcpy(srv_players[seat].name, payload.data(), 40);
                 srv_players[seat].state = 0xff; // next: create/join
             } else if (pkt == CTOS_CREATE_GAME && payload.size() >= sizeof(HostInfo) + 80) {
-                // Host must live at seat 0 (game loop routes engine player 0
-                // there, and only seat 0 may press start). If the joiner
-                // connected first, swap the seats so the host lands at 0.
+                if (seat >= SRV_PLAYER_SEATS) { reject_seat(seat, ERRMSG_JOINERROR, 0); continue; }
                 std::memcpy(&srv_host_info, payload.data(), sizeof(HostInfo));
+                srv_match_mode = (srv_host_info.mode == 1);
+                // room password from the host (UTF-16 field after the 20-char name)
+                srv_room_pass.clear();
+                for (size_t i = 0; i < 20; ++i) {
+                    char c = (char)payload[sizeof(HostInfo) + 40 + i * 2];
+                    if (!c) break;
+                    srv_room_pass += c;
+                }
                 host_info_received = true;
                 if (seat != 0) {
                     std::swap(srv_players[0], srv_players[seat]);
@@ -3492,23 +4057,44 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
             } else if (pkt == CTOS_JOIN_GAME && payload.size() >= 48) {
                 uint16_t ver;
                 std::memcpy(&ver, payload.data(), 2);
-                if (ver != PRO_VERSION) {
-                    STOC_ErrorMsg err; err.msg = ERRMSG_VERERROR; err.code = PRO_VERSION;
-                    net::write_packet(srv_players[seat].fd, STOC_ERROR_MSG, (const uint8_t*)&err, 8);
-                    net::close(srv_players[seat].fd);
-                    return 1;
+                if (ver != PRO_VERSION) { reject_seat(seat, ERRMSG_VERERROR, PRO_VERSION); continue; }
+                // password check (joiner's pass at offset 8)
+                if (!srv_room_pass.empty()) {
+                    std::string jp;
+                    for (size_t i = 0; i < 20; ++i) {
+                        char c = (char)payload[8 + i * 2];
+                        if (!c) break;
+                        jp += c;
+                    }
+                    if (jp != srv_room_pass) { reject_seat(seat, ERRMSG_JOINERROR, 0); continue; }
+                }
+                if (seat >= SRV_PLAYER_SEATS) {
+                    // Player connection landed in an observer slot: if a player
+                    // seat is still free, move them there.
+                    int free_seat = -1;
+                    for (int s = 0; s < SRV_PLAYER_SEATS; ++s) if (srv_players[s].fd < 0) { free_seat = s; break; }
+                    if (free_seat >= 0) {
+                        std::swap(srv_players[free_seat], srv_players[seat]);
+                        seat = free_seat;
+                    }
+                    // else: stays in observer slot until HS_TOOBSERVER; a later
+                    // player-signal (deck/ready) triggers the room-full error.
                 }
                 srv_players[seat].type = NETPLAYER_TYPE_PLAYER2;
-                srv_players[seat].state = CTOS_UPDATE_DECK;
+                // Observer slots (2+) never upload decks; keep the state open so
+                // CTOS_HS_TOOBSERVER passes the state gate.
+                srv_players[seat].state = (seat >= SRV_PLAYER_SEATS) ? 0xff : CTOS_UPDATE_DECK;
                 srv_send_join(seat);
             } else if (pkt == CTOS_UPDATE_DECK) {
-                if (payload.size() < 8) { net::close(srv_players[seat].fd); return 1; }
+                if (payload.size() < 8) { reject_seat(seat, ERRMSG_DECKERROR, 0); continue; }
                 uint32_t mainc, sidec;
                 std::memcpy(&mainc, payload.data(), 4);
                 std::memcpy(&sidec, payload.data() + 4, 4);
-                if ((size_t)(mainc + sidec) > payload.size() / 4) { net::close(srv_players[seat].fd); return 1; }
+                if ((size_t)(mainc + sidec) > payload.size() / 4) { reject_seat(seat, ERRMSG_DECKERROR, 0); continue; }
                 const uint8_t* dp = payload.data() + 8;
-                // Split main vs extra by card type (TYPES_EXTRA_DECK).
+                srv_players[seat].deck_main.clear();
+                srv_players[seat].deck_extra.clear();
+                srv_players[seat].deck_side.clear();
                 for (uint32_t i = 0; i < mainc; ++i) {
                     uint32_t code; std::memcpy(&code, dp + i * 4, 4);
                     auto it = card_datas.find(code);
@@ -3522,26 +4108,44 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
                 }
                 if (srv_players[seat].deck_main.size() < 40 || srv_players[seat].deck_main.size() > 60
                         || srv_players[seat].deck_extra.size() > 15) {
-                    STOC_ErrorMsg err; err.msg = ERRMSG_DECKERROR; err.code = 0;
-                    net::write_packet(srv_players[seat].fd, STOC_ERROR_MSG, (const uint8_t*)&err, 8);
-                    net::close(srv_players[seat].fd);
-                    return 1;
+                    // Deck rejected: tell the client and keep the server alive
+                    // (the client exits the room per ygo_client semantics).
+                    reject_seat(seat, ERRMSG_DECKERROR, 0);
+                    deck_received[seat] = false;
+                    continue;
                 }
-                deck_received[seat] = true;
-                srv_players[seat].state = CTOS_HS_READY;
-                fprintf(stderr, "player %d deck ok: %zu main / %zu extra\n", seat,
-                        srv_players[seat].deck_main.size(), srv_players[seat].deck_extra.size());
+                if (seat < SRV_PLAYER_SEATS) {
+                    deck_received[seat] = true;
+                    srv_players[seat].state = CTOS_HS_READY;
+                    fprintf(stderr, "player %d deck ok: %zu main / %zu extra\n", seat,
+                            srv_players[seat].deck_main.size(), srv_players[seat].deck_extra.size());
+                }
             } else if (pkt == CTOS_HS_READY) {
+                if (seat >= SRV_PLAYER_SEATS) { reject_seat(seat, ERRMSG_JOINERROR, 0); continue; }
                 if (srv_players[seat].ready) continue;
                 srv_players[seat].ready = true;
                 srv_players[seat].state = 0xff; // open; only host may start
                 fprintf(stderr, "player %d ready\n", seat);
-                // notify both players of the new ready state
                 for (int p = 0; p < 2; ++p) {
                     STOC_HS_PlayerChange ch{};
                     ch.status = (uint8_t)((seat << 4) | PLAYERCHANGE_READY);
                     net::write_packet(srv_players[p].fd, STOC_HS_PLAYER_CHANGE, (const uint8_t*)&ch, 1);
                 }
+            } else if (pkt == CTOS_HS_TOOBSERVER) {
+                // Become an observer: if sitting on a player seat while a player
+                // seat is free, move to an observer slot first.
+                if (seat < SRV_PLAYER_SEATS) {
+                    int free_obs = -1;
+                    for (int s = SRV_PLAYER_SEATS; s < SRV_MAX_SEATS; ++s)
+                        if (srv_players[s].fd < 0) { free_obs = s; break; }
+                    if (free_obs >= 0) {
+                        std::swap(srv_players[free_obs], srv_players[seat]);
+                        seat = free_obs;
+                    }
+                }
+                srv_players[seat].type = NETPLAYER_TYPE_OBSERVER;
+                srv_players[seat].state = 0xff;
+                fprintf(stderr, "seat %d is now an observer\n", seat);
             } else if (pkt == CTOS_HS_START) {
                 if (seat != 0) continue;
                 host_started = 1;
@@ -3577,13 +4181,22 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
         if (!any_activity) usleep(1000);
     }
 
-    // RPS + turn preference
+    // ---- Game 1: RPS + turn preference. ----
+    bool game1_played = false;
     while (srv_duel_stage == DUEL_STAGE_FINGER || srv_duel_stage == DUEL_STAGE_FIRSTGO) {
         for (int seat = 0; seat < 2; ++seat) {
             std::vector<uint8_t> payload;
             uint8_t pkt = 0;
             int n = srv_read_packet(seat, &pkt, payload, 50);
-            if (n < 0) continue;
+            if (n < 0) continue;   // 50ms poll timeout (or disconnect); not fatal here
+            if (pkt == CTOS_SURRENDER || pkt == CTOS_LEAVE_GAME) {
+                // A player surrendered/left before/during RPS: end the room.
+                fprintf(stderr, "player %d %s before the duel started\n", seat,
+                        pkt == CTOS_SURRENDER ? "surrendered" : "left");
+                srv_duel_abort = true;
+                srv_duel_stage = DUEL_STAGE_END;
+                break;
+            }
             if (pkt == CTOS_HAND_RESULT && srv_duel_stage == DUEL_STAGE_FINGER && payload.size() >= 1) {
                 srv_hand_result[seat] = payload[0];
                 if (srv_hand_result[0] && srv_hand_result[1]) {
@@ -3611,84 +4224,147 @@ static int run_server(const std::string& bind_ip, uint16_t port) {
             } else if (pkt == CTOS_TP_RESULT && srv_duel_stage == DUEL_STAGE_FIRSTGO && payload.size() >= 1) {
                 bool swap = ((payload[0] && seat == 1) || (!payload[0] && seat == 0));
                 srv_duel_stage = DUEL_STAGE_DUELING;
-                // Build the duel now.
-                Deck decks[2];
-                decks[0] = Deck{srv_players[0].deck_main, srv_players[0].deck_extra};
-                decks[1] = Deck{srv_players[1].deck_main, srv_players[1].deck_extra};
-                if (swap) std::swap(decks[0], decks[1]);
-
-                // Shuffle
-                std::mt19937 rng;
-                std::random_device rd;
-                rng.seed(rd());
-                for (int i = 0; i < 2; i++) {
-                    std::shuffle(decks[i].main.begin(), decks[i].main.end(), rng);
-                    std::shuffle(decks[i].extra.begin(), decks[i].extra.end(), rng);
-                }
-                uint32_t seed[SEED_COUNT];
-                for (int i = 0; i < SEED_COUNT; i++) seed[i] = rd();
-
-                mcp_setup_engine();
-                if (global_pduel) { end_duel(global_pduel); global_pduel = 0; }
-                global_pduel = create_duel_v2(seed);
-                set_player_info(global_pduel, 0, srv_host_info.start_lp ? srv_host_info.start_lp : 8000,
-                                srv_host_info.start_hand ? srv_host_info.start_hand : 5,
-                                srv_host_info.draw_count ? srv_host_info.draw_count : 1);
-                set_player_info(global_pduel, 1, srv_host_info.start_lp ? srv_host_info.start_lp : 8000,
-                                srv_host_info.start_hand ? srv_host_info.start_hand : 5,
-                                srv_host_info.draw_count ? srv_host_info.draw_count : 1);
-                for (int i = 0; i < 2; i++) {
-                    for (size_t j = 0; j < decks[i].main.size(); j++)
-                        new_card(global_pduel, decks[i].main[j], i, i, LOCATION_DECK, decks[i].main.size() - 1 - j, POS_FACEDOWN_DEFENSE);
-                    for (size_t j = 0; j < decks[i].extra.size(); j++)
-                        new_card(global_pduel, decks[i].extra[j], i, i, LOCATION_EXTRA, j, POS_FACEDOWN_DEFENSE);
-                }
-                int rule = srv_host_info.duel_rule ? srv_host_info.duel_rule : CURRENT_RULE;
-                // MSG_START (hand-built, per gframe)
-                uint8_t startbuf[32]{};
-                uint8_t* sp = startbuf;
-                BufferIO::Write<uint8_t>(sp, MSG_START);
-                BufferIO::Write<uint8_t>(sp, 0);
-                BufferIO::Write<uint8_t>(sp, (uint8_t)rule);
-                BufferIO::Write<int32_t>(sp, srv_host_info.start_lp ? srv_host_info.start_lp : 8000);
-                BufferIO::Write<int32_t>(sp, srv_host_info.start_lp ? srv_host_info.start_lp : 8000);
-                BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 0, LOCATION_DECK));
-                BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 0, LOCATION_EXTRA));
-                BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 1, LOCATION_DECK));
-                BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 1, LOCATION_EXTRA));
-                int seat0_first = swap ? 1 : 0;
-                srv_send(seat0_first, STOC_GAME_MSG, startbuf, 19);
-                startbuf[1] = 1;
-                srv_send(1 - seat0_first, STOC_GAME_MSG, startbuf, 19);
-                srv_refresh_extra(0);
-                srv_refresh_extra(1);
-                uint32_t opt = (uint32_t)rule << 16;
-                start_duel(global_pduel, opt);
-                srv_game_loop();
-                // After game loop: notify end
-                srv_duel_stage = DUEL_STAGE_END;
-                net::send_packet(srv_players[0].fd, STOC_DUEL_END);
-                net::send_packet(srv_players[1].fd, STOC_DUEL_END);
-                if (global_pduel) { end_duel(global_pduel); global_pduel = 0; }
-                net::close(srv_players[0].fd);
-                net::close(srv_players[1].fd);
-                net::close(srv_listen_fd);
-                return 0;
+                srv_play_one_game(swap, 1);
+                game1_played = true;
+                srv_duel_stage = DUEL_STAGE_SIDING;
             }
         }
         usleep(1000);
     }
+
+    // ---- Match continuation: side phase + next games (best-of-3). ----
+    int game_index = 1;
+    while (srv_match_mode && !srv_duel_abort && srv_last_winner >= 0) {
+        srv_match_wins[srv_last_winner]++;
+        fprintf(stderr, "game %d over: player %d wins (score %d-%d)\n", game_index,
+                srv_last_winner, srv_match_wins[0], srv_match_wins[1]);
+        if (srv_match_wins[srv_last_winner] >= 2) break;
+
+        // Side-deck exchange: ask both players for their (possibly new) deck.
+        srv_duel_stage = DUEL_STAGE_SIDING;
+        net::send_packet(srv_players[0].fd, STOC_CHANGE_SIDE);
+        net::send_packet(srv_players[1].fd, STOC_CHANGE_SIDE);
+        bool got_deck[2] = {false, false};
+        while (!(got_deck[0] && got_deck[1])) {
+            for (int seat = 0; seat < 2; ++seat) {
+                if (got_deck[seat]) continue;
+                std::vector<uint8_t> payload;
+                uint8_t pkt = 0;
+                int n = srv_read_packet(seat, &pkt, payload, 50);
+                if (n < 0) continue;   // 50ms poll timeout; keep waiting
+                if (pkt != CTOS_UPDATE_DECK || payload.size() < 8) continue;
+                uint32_t mainc, sidec;
+                std::memcpy(&mainc, payload.data(), 4);
+                std::memcpy(&sidec, payload.data() + 4, 4);
+                if ((size_t)(mainc + sidec) > payload.size() / 4) continue;
+                const uint8_t* dp = payload.data() + 8;
+                std::vector<uint32_t> nm, ne, ns;
+                for (uint32_t i = 0; i < mainc; ++i) {
+                    uint32_t code; std::memcpy(&code, dp + i * 4, 4);
+                    auto it = card_datas.find(code);
+                    bool is_extra = it != card_datas.end() && (it->second.type & TYPES_EXTRA_DECK);
+                    if (is_extra) ne.push_back(code); else nm.push_back(code);
+                }
+                for (uint32_t i = 0; i < sidec; ++i) {
+                    uint32_t code; std::memcpy(&code, dp + (mainc + i) * 4, 4);
+                    ns.push_back(code);
+                }
+                if (nm.size() < 40 || nm.size() > 60 || ne.size() > 15) {
+                    STOC_ErrorMsg err{}; err.msg = ERRMSG_SIDEERROR; err.code = 0;
+                    net::write_packet(srv_players[seat].fd, STOC_ERROR_MSG, (const uint8_t*)&err, 8);
+                    continue;   // keep waiting for a valid side deck
+                }
+                srv_players[seat].deck_main = nm;
+                srv_players[seat].deck_extra = ne;
+                srv_players[seat].deck_side = ns;
+                got_deck[seat] = true;
+                fprintf(stderr, "player %d side deck ok: %zu main / %zu extra\n", seat,
+                        nm.size(), ne.size());
+            }
+            if (srv_duel_abort) break;
+            usleep(1000);
+        }
+        if (srv_duel_abort) break;
+
+        // Loser of the previous game picks who goes first (gframe match rule).
+        int loser = 1 - srv_last_winner;
+        net::send_packet(srv_players[loser].fd, STOC_SELECT_TP);
+        bool swap = false;
+        bool tp_ok = false;
+        while (!tp_ok && !srv_duel_abort) {
+            std::vector<uint8_t> payload;
+            uint8_t pkt = 0;
+            int n = srv_read_packet(loser, &pkt, payload, 50);
+            if (n < 0) continue;   // 50ms poll timeout; keep waiting
+            if (pkt == CTOS_TP_RESULT && payload.size() >= 1) {
+                swap = (payload[0] == 1);   // 0 = seat 0 first, 1 = seat 1 first
+                tp_ok = true;
+            }
+            usleep(1000);
+        }
+        if (srv_duel_abort) break;
+
+        srv_duel_stage = DUEL_STAGE_DUELING;
+        srv_last_winner = -1;
+        game_index++;
+        if (!srv_play_one_game(swap, game_index)) break;
+    }
+
+    // ---- Match over (or aborted): notify and close. ----
+    net::send_packet(srv_players[0].fd, STOC_DUEL_END);
+    net::send_packet(srv_players[1].fd, STOC_DUEL_END);
+    for (int seat = 0; seat < SRV_MAX_SEATS; ++seat) {
+        if (srv_players[seat].fd >= 0) net::close(srv_players[seat].fd);
+    }
+    net::close(srv_listen_fd);
+    fprintf(stderr, "server: match finished (score %d-%d), closing\n",
+            srv_match_wins[0], srv_match_wins[1]);
     return 0;
 }
 
 // Receive a response from the expected player and feed it into the engine.
 // Called after srv_game_loop() returns 1 (waiting).
 static void srv_await_response() {
+    // Handle a surrender (or leave) from either player. winner = the player
+    // who did NOT surrender. Returns true if the duel should end.
+    auto handle_surrender = [](int who) {
+        fprintf(stderr, "player %d surrendered\n", who);
+        int winner = 1 - who;
+        uint8_t win[3] = {MSG_WIN, (uint8_t)winner, 0};
+        srv_replay_add(win, 3);            // record the win in the replay stream
+        srv_send_msg(0, win, win + 3);
+        srv_send_msg(1, win, win + 3);
+        srv_send_obs(win, win + 3);
+        srv_last_winner = winner;
+        srv_surrender_winner = winner;
+        srv_last_response = -1;
+    };
     while (srv_last_response >= 0) {
         int seat = srv_last_response;
+        int other = 1 - seat;
+        // Non-blocking check of the OTHER player: they may surrender (or leave)
+        // while the acting player is thinking. The acting player's read below
+        // blocks, so this poll is what lets a surrender from the bystander in.
+        if (srv_players[other].fd >= 0) {
+            pollfd op{};
+            op.fd = srv_players[other].fd;
+            op.events = POLLIN;
+            if (::poll(&op, 1, 0) > 0) {
+                std::vector<uint8_t> opbuf;
+                uint8_t opkt = 0;
+                int on = srv_read_packet(other, &opkt, opbuf, 100);
+                if (on >= 0 && opkt == CTOS_SURRENDER) { handle_surrender(other); return; }
+                if (on >= 0 && opkt == CTOS_LEAVE_GAME) {
+                    fprintf(stderr, "player %d left the room\n", other);
+                    srv_duel_abort = true;
+                    srv_last_response = -1;
+                    return;
+                }
+            }
+        }
         std::vector<uint8_t> payload;
         uint8_t pkt = 0;
-        int n = srv_read_packet(seat, &pkt, payload, -1);
+        int n = srv_read_packet(seat, &pkt, payload, -1);   // blocking read (EOF = disconnect)
         if (n < 0) {
             fprintf(stderr, "server: player %d disconnected\n", seat);
             net::close(srv_players[seat].fd);
@@ -3713,10 +4389,9 @@ static void srv_await_response() {
             if (srv_duel_abort) return;
             continue;
         }
-        if (pkt == CTOS_SURRENDER) {
-            fprintf(stderr, "player %d surrendered\n", seat);
-            net::close(srv_players[seat].fd);
-            srv_players[seat].fd = -1;
+        if (pkt == CTOS_SURRENDER) { handle_surrender(seat); return; }
+        if (pkt == CTOS_LEAVE_GAME) {
+            fprintf(stderr, "player %d left the room\n", seat);
             srv_duel_abort = true;
             srv_last_response = -1;
             return;
@@ -3861,6 +4536,13 @@ static int cli_handle_msg(uint8_t*& p, uint8_t* end) {
         // in sync (mirrors the server's srv_analyze skip lengths).
         switch (msg) {
         case MSG_START: {
+            // A new game begins (also each game of a match): reset game state.
+            cli_field.clear();
+            cli_has_prompt = false;
+            cli_game_over = false;
+            cli_winner = -1;
+            cli_turn = 1;
+            cli_phase = 0x04;
             // gframe MSG_START: player(1) rule(1) lp0(4) lp1(4) deck0(2) extra0(2) deck1(2) extra1(2)
             BufferIO::Read<uint8_t>(p); // player
             BufferIO::Read<uint8_t>(p); // rule
@@ -3889,7 +4571,7 @@ static int cli_handle_msg(uint8_t*& p, uint8_t* end) {
         case MSG_DECK_TOP: p += 6; break;
         case MSG_SHUFFLE_SET_CARD: { BufferIO::Read<uint8_t>(p); uint8_t c=BufferIO::Read<uint8_t>(p); p += c*8; break; }
         case MSG_POS_CHANGE: p += 9; break;
-        case MSG_SET: p += 4; break;
+        case MSG_SET: p += 8; break;   // code(4) + info_location(4)
         case MSG_SWAP: p += 16; break;
         case MSG_FIELD_DISABLED: p += 4; break;
         case MSG_SUMMONING:
@@ -3949,6 +4631,9 @@ static int cli_process_game_msg(uint8_t* data, size_t len) {
 // Receive STOC packets until we have a prompt or game over or timeout.
 // Handles pre-duel handshake: STOC_SELECT_HAND (RPS) and STOC_SELECT_TP.
 // Returns 0 if a prompt is pending (cli_has_prompt), 1 game over, -1 waiting/timeout.
+// Returns: 0 = prompt pending (cli_has_prompt), 1 = game over (MSG_WIN or
+// STOC_DUEL_END), 2 = fatal error received from server (STOC_ERROR_MSG),
+// -1 = timeout / disconnected.
 static int cli_read_until_prompt(int timeout_ms) {
     std::vector<uint8_t> buf;
     while (true) {
@@ -3969,6 +4654,10 @@ static int cli_read_until_prompt(int timeout_ms) {
             if (r == 2) return 1;           // game over
             continue;
         }
+        if (proto == STOC_ERROR_MSG) {
+            // Server rejected us (room full / deck rejected / version / game started).
+            return 2;
+        }
         if (proto == STOC_SELECT_HAND) {
             // auto rock/paper/scissors: seat-dependent value
             uint8_t res = (uint8_t)((net_client_seat == 0) ? 1 : 2);
@@ -3977,8 +4666,27 @@ static int cli_read_until_prompt(int timeout_ms) {
             continue;
         }
         if (proto == STOC_SELECT_TP) {
+            if (std::getenv("YGOCLI_MCP_DEBUG")) fprintf(stderr, "cli got STOC_SELECT_TP\n");
             std::vector<uint8_t> tp = {0};
             net::write_packet(net_client_fd, CTOS_TP_RESULT, tp.data(), 1);
+            continue;
+        }
+        if (proto == STOC_CHANGE_SIDE) {
+            // Match side-deck phase: re-upload our deck (side changes are not yet
+            // exposed; same-deck continuation keeps the match flowing).
+            if (!cli_deck_codes.empty()) {
+                std::vector<uint8_t> dk;
+                uint32_t mainc = (uint32_t)cli_deck_codes.size();
+                uint32_t sidec = 0;
+                uint8_t hdr[8];
+                std::memcpy(hdr, &mainc, 4);
+                std::memcpy(hdr + 4, &sidec, 4);
+                dk.insert(dk.end(), hdr, hdr + 8);
+                for (uint32_t c : cli_deck_codes) {
+                    uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4);
+                }
+                net::write_packet(net_client_fd, CTOS_UPDATE_DECK, dk.data(), dk.size());
+            }
             continue;
         }
         if (proto == STOC_DUEL_END) return 1;
@@ -4031,30 +4739,52 @@ static std::string cli_render_field() {
     return out.str();
 }
 
-// Connect + handshake to the server. Returns 0 on success.
+// Resolve the ygo_client/ygo_observe "deck" param: a path to a .ydk file, or an
+// array of card codes. Returns the code list (main+extra unsplit) or false.
+static bool resolve_deck_codes(const nlohmann::json& deck, std::vector<uint32_t>& codes) {
+    codes.clear();
+    if (deck.is_string()) {
+        Deck d = load_deck(deck.get<std::string>());
+        if (d.main.empty() && d.extra.empty()) return false;
+        codes.insert(codes.end(), d.main.begin(), d.main.end());
+        codes.insert(codes.end(), d.extra.begin(), d.extra.end());
+        return true;
+    }
+    if (deck.is_array()) {
+        for (const auto& v : deck) {
+            if (v.is_number()) codes.push_back((uint32_t)v.get<int64_t>());
+            else if (v.is_string()) codes.push_back((uint32_t)std::strtoul(v.get<std::string>().c_str(), nullptr, 10));
+        }
+        return !codes.empty();
+    }
+    return false;
+}
+
+// UTF-16LE writer for gframe name/pass fields (narrow chars -> low bytes).
+static void utf16_write(std::vector<uint8_t>& v, size_t offset, const std::string& s, size_t max_chars) {
+    for (size_t i = 0; i < s.size() && i < max_chars; ++i) v[offset + i * 2] = (uint8_t)s[i];
+}
+
+// Connect + handshake to the server. Returns 0 on success, -1 on I/O failure,
+// or the STOC_ErrorMsg code (ERRMSG_*) when the server rejects us.
 static int cli_connect_and_join(const std::string& host, uint16_t port,
-                                bool create_game, const std::string& deck_path,
-                                const std::string& name, int lp, int start_hand, int draw_count, int rule) {
+                                bool create_game, const std::vector<uint32_t>& deck_codes,
+                                const std::string& name, const std::string& password,
+                                int lp, int start_hand, int draw_count, int rule, int mode) {
     net_client_fd = net::connect(host, port);
     if (net_client_fd < 0) return -1;
     net_client_connected = true;
+    cli_deck_codes = deck_codes;
 
     // CTOS_PLAYER_INFO
     std::vector<uint8_t> ni(40, 0);
-    for (size_t i = 0; i < name.size() && i < 20; ++i) {
-        // UTF-16LE per gframe; write narrow chars into low bytes (ASCII names)
-        ni[i * 2] = (uint8_t)name[i];
-    }
+    utf16_write(ni, 0, name, 20);
     net::write_packet(net_client_fd, CTOS_PLAYER_INFO, ni.data(), 40);
-
-    // load deck
-    Deck deck = load_deck(deck_path);
-    if (deck.main.empty() && deck.extra.empty()) return -1;
 
     if (create_game) {
         HostInfo hi{};
         hi.rule = rule;
-        hi.mode = 0;
+        hi.mode = (uint8_t)mode;
         hi.duel_rule = (uint8_t)rule;
         hi.no_check_deck = 0;
         hi.no_shuffle_deck = 0;
@@ -4064,42 +4794,51 @@ static int cli_connect_and_join(const std::string& host, uint16_t port,
         hi.time_limit = 0;
         std::vector<uint8_t> cg(sizeof(CTOS_CreateGame), 0);
         std::memcpy(cg.data(), &hi, sizeof(HostInfo));
-        for (size_t i = 0; i < name.size() && i < 20; ++i) cg[sizeof(HostInfo) + i * 2] = (uint8_t)name[i];
+        utf16_write(cg, sizeof(HostInfo), name, 20);
+        utf16_write(cg, sizeof(HostInfo) + 40, password, 20);
         net::write_packet(net_client_fd, CTOS_CREATE_GAME, cg.data(), cg.size());
     } else {
         std::vector<uint8_t> jg(sizeof(CTOS_JoinGame), 0);
         uint16_t ver = PRO_VERSION;
         std::memcpy(jg.data(), &ver, 2);
+        uint32_t gameid = 0;
+        std::memcpy(jg.data() + 4, &gameid, 4);
+        utf16_write(jg, 8, password, 20);
         net::write_packet(net_client_fd, CTOS_JOIN_GAME, jg.data(), jg.size());
     }
 
-    // read STOC_JOIN_GAME + STOC_TYPE_CHANGE to learn our seat
+    // read STOC_JOIN_GAME + STOC_TYPE_CHANGE to learn our seat; STOC_ERROR_MSG
+    // (room full / deck rejected / version / game started) aborts with its code.
     std::vector<uint8_t> buf;
     bool got_type = false;
     while (!got_type) {
         int n = net::read_packet(net_client_fd, buf, 3000);
         if (n < 0) return -1;
         if (buf.empty()) return -1;
+        if (buf[0] == STOC_ERROR_MSG && n >= 8) {
+            STOC_ErrorMsg err;
+            std::memcpy(&err, buf.data() + 1, sizeof err);
+            return (int)err.code ? (int)err.code : (int)err.msg;
+        }
         if (buf[0] == STOC_TYPE_CHANGE && n >= 1) {
             net_client_seat = buf[1] & 0x0f;  // low nibble = seat
-            if (buf[1] & 0x10) create_game = true;
+            // NOTE: do not treat the 0x10 "host" bit as create_game: when the
+            // joiner connects before the host, the server seats it at 0 and the
+            // TYPE_CHANGE carries 0x10 until the host's create swaps seats, which
+            // would make the joiner wrongly act as host (sends HS_START, then
+            // blocks waiting for the opponent in an 8s loop). The caller's
+            // create_game flag is authoritative.
             got_type = true;
         }
     }
 
     // upload deck (main+extra as one list; server splits by type)
     std::vector<uint8_t> dk;
-    auto push = [&](const std::vector<uint32_t>& v) {
-        uint32_t c = (uint32_t)v.size();
-        uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4);
-    };
-    // mainc = main.size()+extra.size(); sidec = 0
-    uint32_t mainc = (uint32_t)(deck.main.size() + deck.extra.size());
+    uint32_t mainc = (uint32_t)cli_deck_codes.size();
     uint32_t sidec = 0;
     uint8_t hdr[8]; std::memcpy(hdr, &mainc, 4); std::memcpy(hdr + 4, &sidec, 4);
     dk.insert(dk.end(), hdr, hdr + 8);
-    for (uint32_t c : deck.main) { uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4); }
-    for (uint32_t c : deck.extra) { uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4); }
+    for (uint32_t c : cli_deck_codes) { uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4); }
     net::write_packet(net_client_fd, CTOS_UPDATE_DECK, dk.data(), dk.size());
 
     // ready
@@ -4113,11 +4852,27 @@ static int cli_connect_and_join(const std::string& host, uint16_t port,
             int n = net::read_packet(net_client_fd, hb, 200);
             if (n < 0) { t0 += 200; continue; }
             if (hb.empty()) { t0 += 200; continue; }
+            if (hb[0] == STOC_ERROR_MSG) {
+                STOC_ErrorMsg err;
+                if (n >= 8) std::memcpy(&err, hb.data() + 1, sizeof err);
+                return (int)err.code ? (int)err.code : (int)err.msg;
+            }
             // HS_PLAYER_CHANGE with the joiner's READY -> start
             if (hb[0] == STOC_HS_PLAYER_CHANGE) { net::send_packet(net_client_fd, CTOS_HS_START); break; }
         }
     }
     return 0;
+}
+
+// Human-readable reason for a server rejection (ERRMSG_* codes).
+static std::string cli_err_reason(int code) {
+    switch (code) {
+    case ERRMSG_JOINERROR: return "room full or join rejected";
+    case ERRMSG_DECKERROR: return "deck rejected (illegal or invalid)";
+    case ERRMSG_SIDEERROR: return "side deck rejected";
+    case ERRMSG_VERERROR: return "version mismatch";
+    default: return "server error (code " + std::to_string(code) + ")";
+    }
 }
 
 // ygo_client MCP tool: connect/join, then read until our prompt or "waiting".
@@ -4126,14 +4881,26 @@ static std::string mcp_tool_ygo_client(const nlohmann::json& params) {
         std::string host = params.value("host", "127.0.0.1");
         int port = params.value("port", 7911);
         bool create = params.value("create_game", false);
-        std::string deck = params.value("deck", mcp_deck0_path);
+        nlohmann::json deck = params.contains("deck") ? params["deck"] : nlohmann::json(mcp_deck0_path);
         std::string name = params.value("name", "ygocli");
+        std::string password = params.value("password", "");
         int lp = params.value("lp", 8000);
         int hand = params.value("start_hand", 5);
         int draw = params.value("draw_count", 1);
         int rule = params.value("rule", CURRENT_RULE);
-        if (cli_connect_and_join(host, port, create, deck, name, lp, hand, draw, rule) != 0)
-            return "Error: cannot connect to server";
+        int mode = params.value("mode", 1);   // default: best-of-3 match
+        std::vector<uint32_t> codes;
+        if (!resolve_deck_codes(deck, codes)) return "Error: invalid deck (need a .ydk path or array of card codes)";
+        int rc = cli_connect_and_join(host, port, create, codes, name, password,
+                                      lp, hand, draw, rule, mode);
+        if (rc != 0) {
+            // Spec: on failure, return error and stop the connection (exit room).
+            net::close(net_client_fd);
+            net_client_fd = -1;
+            net_client_connected = false;
+            if (rc < 0) return "Error: cannot connect to server (" + host + ":" + std::to_string(port) + ")";
+            return "Error: " + cli_err_reason(rc) + " - connection closed";
+        }
         cli_clear_field();
     }
 
@@ -4149,6 +4916,13 @@ static std::string mcp_tool_ygo_client(const nlohmann::json& params) {
     std::ostringstream out;
     if (!narration.empty()) out << narration;
     out << cli_render_field();
+    if (r == 2) {
+        // Server rejected us mid-game (deck rejected / game started). Exit room.
+        net::close(net_client_fd);
+        net_client_fd = -1;
+        net_client_connected = false;
+        return "Error: server rejected the connection - closed";
+    }
     if (r == 1) {
         if (cli_game_over) out << "Game Over: Player " << cli_winner << " wins!\n";
         else out << "Game Over (duel ended without a winner)\n";
@@ -4161,33 +4935,225 @@ static std::string mcp_tool_ygo_client(const nlohmann::json& params) {
     return out.str();
 }
 
-int main(int argc, char* argv[]) {
-    // Dedicated network server subcommand: ygocli server [--port N] [--bind ip]
-    if (argc >= 2 && std::string(argv[1]) == "server") {
-        std::string bind_ip = "0.0.0.0";
-        uint16_t port = 7911;
-        for (int i = 2; i < argc; i++) {
-            if (std::string(argv[i]) == "--port" && i + 1 < argc) {
-                port = (uint16_t)std::strtoul(argv[i + 1], nullptr, 10);
-                i++;
-            } else if (std::string(argv[i]) == "--bind" && i + 1 < argc) {
-                bind_ip = argv[i + 1];
-                i++;
+// ygo_exit: close the current network connection (leave the room).
+static std::string mcp_tool_ygo_exit(const nlohmann::json&) {
+    if (!net_client_connected || net_client_fd < 0) return "No active connection";
+    net::close(net_client_fd);
+    net_client_fd = -1;
+    net_client_connected = false;
+    cli_clear_field();
+    cli_deck_codes.clear();
+    cli_game_over = false;
+    cli_winner = -1;
+    return "Left the room (connection closed)";
+}
+
+// ygo_surrender: send CTOS_SURRENDER and keep reading. In a match the server
+// declares the opponent the winner, runs the side-deck phase, and starts the
+// next game; in a single game it ends the duel.
+static std::string mcp_tool_ygo_surrender(const nlohmann::json&) {
+    if (!net_client_connected || net_client_fd < 0) return "Error: not connected to a server";
+    net::send_packet(net_client_fd, CTOS_SURRENDER);
+    net_client_mode = true;
+    mcp_begin_capture();
+    int r = cli_read_until_prompt(500);
+    std::string narration = mcp_take_capture();
+    mcp_end_capture();
+    net_client_mode = false;
+    std::ostringstream out;
+    if (!narration.empty()) out << narration;
+    out << cli_render_field();
+    if (r == 2) { net::close(net_client_fd); net_client_fd = -1; net_client_connected = false;
+                  return "Error: server rejected the connection - closed"; }
+    if (r == 1) {
+        if (cli_game_over) out << "You surrendered - Game Over: Player " << cli_winner << " wins!\n";
+        else out << "You surrendered - Game Over (no winner)\n";
+        return out.str();
+    }
+    out << "(surrendered, waiting for next game)\n";
+    return out.str();
+}
+
+// ygo_observe: connect as observer (sees public info, never prompted).
+static std::string mcp_tool_ygo_observe(const nlohmann::json& params) {
+    if (!net_client_connected || net_client_fd < 0) {
+        std::string host = params.value("host", "127.0.0.1");
+        int port = params.value("port", 7911);
+        std::string name = params.value("name", "observer");
+        std::string password = params.value("password", "");
+        // Observers send PLAYER_INFO + JOIN_GAME, then switch to observer role.
+        net_client_fd = net::connect(host, port);
+        if (net_client_fd < 0) return "Error: cannot connect to " + host + ":" + std::to_string(port);
+        net_client_connected = true;
+        std::vector<uint8_t> ni(40, 0);
+        utf16_write(ni, 0, name, 20);
+        net::write_packet(net_client_fd, CTOS_PLAYER_INFO, ni.data(), 40);
+        std::vector<uint8_t> jg(sizeof(CTOS_JoinGame), 0);
+        uint16_t ver = PRO_VERSION;
+        std::memcpy(jg.data(), &ver, 2);
+        utf16_write(jg, 8, password, 20);
+        net::write_packet(net_client_fd, CTOS_JOIN_GAME, jg.data(), jg.size());
+        std::vector<uint8_t> buf;
+        bool got_type = false;
+        while (!got_type) {
+            int n = net::read_packet(net_client_fd, buf, 3000);
+            if (n < 0) { net::close(net_client_fd); net_client_fd = -1; net_client_connected = false; return "Error: handshake failed"; }
+            if (buf.empty()) continue;
+            if (buf[0] == STOC_ERROR_MSG && n >= 8) {
+                net::close(net_client_fd); net_client_fd = -1; net_client_connected = false;
+                return "Error: " + cli_err_reason(0) + " - connection closed";
+            }
+            if (buf[0] == STOC_TYPE_CHANGE && n >= 1) {
+                net_client_seat = buf[1] & 0x0f;
+                got_type = true;
             }
         }
-        load_card_database("./cards.cdb");
-        load_strings_conf("./strings.conf");
-        return run_server(bind_ip, port);
+        net::send_packet(net_client_fd, CTOS_HS_TOOBSERVER);
+        cli_clear_field();
+    }
+    net_client_mode = true;
+    mcp_begin_capture();
+    int r = cli_read_until_prompt(500);
+    std::string narration = mcp_take_capture();
+    mcp_end_capture();
+    net_client_mode = false;
+    std::ostringstream out;
+    if (!narration.empty()) out << narration;
+    out << cli_render_field();
+    if (r == 2) { net::close(net_client_fd); net_client_fd = -1; net_client_connected = false;
+                  return "Error: server rejected the connection - closed"; }
+    if (r == 1) {
+        if (cli_game_over) out << "Game Over: Player " << cli_winner << " wins!\n";
+        else out << "Game Over (no winner)\n";
+        return out.str();
+    }
+    if (cli_has_prompt) { cli_has_prompt = false; out << "(observing...)\n"; return out.str(); }
+    out << "(watching, waiting for action)\n";
+    return out.str();
+}
+
+// ygo_replay: play back a saved .yrp replay (ygopro/gframe format).
+// Format: magic "ygopro" (6) + version u32 + seed[8] u32, then chunks of
+// [u32 len][len bytes] until EOF; each chunk is a batch of engine messages.
+static std::string mcp_tool_ygo_replay(const nlohmann::json& params) {
+    std::string file = params.value("file", "");
+    if (file.empty()) return "Error: file parameter required";
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return "Error: cannot open " + file;
+    char magic[6];
+    in.read(magic, 6);
+    if (in.gcount() != 6 || std::memcmp(magic, "ygopro", 6) != 0)
+        return "Error: not a ygopro replay file (bad magic)";
+    uint32_t version = 0;
+    in.read((char*)&version, 4);
+    uint8_t seedbuf[32]{};
+    in.read((char*)seedbuf, sizeof seedbuf);   // header seed (tolerate short files)
+
+    // Fresh view state; the replay's own MSG_START re-initializes LP/decks.
+    cli_clear_field();
+    cli_turn = 1;
+    cli_phase = 0x04;
+    cli_lp[0] = cli_lp[1] = 8000;
+    cli_game_over = false;
+    cli_winner = -1;
+
+    std::ostringstream events;
+    int chunks = 0, turns = 0, damage = 0, summons = 0;
+    while (in) {
+        uint32_t len = 0;
+        in.read((char*)&len, 4);
+        if (!in || len == 0 || len > (1u << 20)) break;
+        std::vector<uint8_t> data(len);
+        in.read((char*)data.data(), len);
+        if (in.gcount() != (std::streamsize)len) break;
+        uint8_t* p = data.data();
+        uint8_t* end = data.data() + len;
+        while (p < end) {
+            uint8_t mt = (p < end) ? *p : 0;
+            // Lightweight timeline stats.
+            if (mt == MSG_NEW_TURN) turns++;
+            else if (mt == MSG_DAMAGE && p + 6 <= end) {
+                int pl = p[1];
+                int32_t d = 0;
+                std::memcpy(&d, p + 2, 4);
+                events << "  P" << pl << " takes " << d << " damage\n";
+                damage++;
+            } else if (mt == MSG_SUMMONING && p + 6 <= end) {
+                uint32_t c = 0;
+                std::memcpy(&c, p + 2, 4);
+                events << "  P" << (int)p[1] << " summons " << get_card_name(c) << "\n";
+                summons++;
+            }
+            int r = cli_handle_msg(p, end);
+            if (r == 2) { cli_game_over = true; break; }
+            if (cli_has_prompt) cli_has_prompt = false;   // replays are fixed; skip prompts
+        }
+        chunks++;
+    }
+    std::ostringstream out;
+    out << "=== Replay: " << file << " (version 0x" << std::hex << version << std::dec
+        << ", " << chunks << " chunks) ===\n";
+    if (turns) out << "Turns played: " << turns << "; summons: " << summons << "; damage events: " << damage << "\n";
+    if (!events.str().empty()) out << events.str();
+    out << "--- final state ---\n" << cli_render_field();
+    if (cli_game_over && cli_winner >= 0) out << "Result: Player " << cli_winner << " wins!\n";
+    else out << "Result: (no MSG_WIN found in replay; file may be truncated)\n";
+    return out.str();
+}
+
+
+int main(int argc, char* argv[]) {
+    // Resolve the executable path/dir early (needed by ygo_server/ygo_windbot
+    // and for locating wiki/, single/, replay/ data folders).
+    {
+        char exe_path[PATH_MAX];
+        if (realpath(argv[0], exe_path)) {
+            g_exe_path = exe_path;
+            size_t slash = g_exe_path.find_last_of('/');
+            if (slash != std::string::npos) g_exe_dir = g_exe_path.substr(0, slash);
+        }
+    }
+
+    // Subcommands: server | mcp | interact. Anything else = usage help.
+    if (argc >= 2) {
+        std::string cmd = argv[1];
+        if (cmd == "server") {
+            std::string bind_ip = "0.0.0.0";
+            uint16_t port = 7911;
+            for (int i = 2; i < argc; i++) {
+                if (std::string(argv[i]) == "--port" && i + 1 < argc) {
+                    port = (uint16_t)std::strtoul(argv[i + 1], nullptr, 10);
+                    i++;
+                } else if (std::string(argv[i]) == "--bind" && i + 1 < argc) {
+                    bind_ip = argv[i + 1];
+                    i++;
+                }
+            }
+            load_card_database("./cards.cdb");
+            load_strings_conf("./strings.conf");
+            return run_server(bind_ip, port);
+        }
+        if (cmd == "interact") {
+            load_card_database("./cards.cdb");
+            load_strings_conf("./strings.conf");
+            mcp_interact_loop();
+            if (db) { sqlite3_close(db); db = nullptr; }
+            return 0;
+        }
+        if (cmd == "mcp") { mcp_mode = true; }
     }
 
     // --mcp works with no deck args (decks arrive via ygo_client params).
     bool wants_mcp = false;
     for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--mcp") wants_mcp = true;
+    if (wants_mcp) mcp_mode = true;
 
-    if (argc < 3 && !wants_mcp) {
+    if (argc < 3 && !mcp_mode) {
         std::cerr << "Usage: " << argv[0] << " <deck0.ydk> <deck1.ydk> [--auto]\n";
-        std::cerr << "       " << argv[0] << " server [--port N] [--bind ip]\n";
-        std::cerr << "       " << argv[0] << " --mcp\n";
+        std::cerr << "       " << argv[0] << " server [--port N] [--bind ip]   launch a duel server\n";
+        std::cerr << "       " << argv[0] << " mcp                          launch MCP server (JSON-RPC over stdio)\n";
+        std::cerr << "       " << argv[0] << " interact                     interactive mode (same engine as MCP)\n";
+        std::cerr << "       " << argv[0] << " --mcp                        (alias of mcp)\n";
         return 1;
     }
 
@@ -4197,8 +5163,6 @@ int main(int argc, char* argv[]) {
         } else if (std::string(argv[i]) == "--random") {
             auto_play = true;
             random_choices = true;
-        } else if (std::string(argv[i]) == "--mcp") {
-            mcp_mode = true;
         }
     }
     const char* random_choices_env = std::getenv("YGOCLI_RANDOM_CHOICES");
@@ -4320,12 +5284,13 @@ int main(int argc, char* argv[]) {
     set_script_reader([](const char* script_name, int* len) -> byte* {
         std::string requested = script_name ? script_name : "";
         std::string path;
-        if (requested.rfind("./script/", 0) == 0) {
-            path = requested;
+        if (!requested.empty() && (requested[0] == '/' || requested.rfind("./", 0) == 0
+                                   || requested.rfind("../", 0) == 0)) {
+            path = requested;            // absolute / explicit relative paths pass through
         } else if (requested.rfind("script/", 0) == 0) {
             path = "./" + requested;
         } else {
-            path = "./script/" + requested;
+            path = "./script/" + requested;   // bare names resolve against script/
         }
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
