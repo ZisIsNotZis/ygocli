@@ -1,10 +1,2 @@
-deck
-
-# build outputs
-ygocli
+replay/
 *.o
-*.a
-*.so
-
-# local logs / traces
-*.log
