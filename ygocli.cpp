@@ -1946,6 +1946,13 @@ void mcp_send_choice(int choice_idx, const std::vector<int>& choice_indices) {
                 else if (idx < sm+sp+rp+ms+ss+ac) { cat = 5; sub = idx - sm - sp - rp - ms - ss; }
                 else if (bp && idx == sm+sp+rp+ms+ss+ac) { cat = 6; sub = 0; }
                 else if (ep && idx == sm+sp+rp+ms+ss+ac+(bp?1:0)) { cat = 7; sub = 0; }
+            } else {
+                // Pass (-1): advance to the next phase. Prefer the End Phase
+                // (cat 7), else Battle Phase (cat 6) in Main1. Without this the
+                // client would send (0xFFFF<<16) which the core rejects with
+                // MSG_RETRY, deadlocking a "pass only" idle prompt.
+                if (ep) { cat = 7; sub = 0; }
+                else if (bp) { cat = 6; sub = 0; }
             }
             send_int((sub << 16) | cat);
             break;
@@ -1964,6 +1971,10 @@ void mcp_send_choice(int choice_idx, const std::vector<int>& choice_indices) {
                 else if (idx < ac+at) { cat = 1; sub = idx - ac; }
                 else if (m2 && idx == ac+at) { cat = 2; sub = 0; }
                 else if (ep && idx == ac+at+(m2?1:0)) { cat = 3; sub = 0; }
+            } else {
+                // Pass (-1): go to Main Phase 2 (cat 2) if allowed, else End.
+                if (m2) { cat = 2; sub = 0; }
+                else if (ep) { cat = 3; sub = 0; }
             }
             send_int((sub << 16) | cat);
             break;
@@ -2562,6 +2573,7 @@ static bool cli_has_prompt = false;
 static bool cli_game_over = false;
 static int cli_winner = 0;
 static int cli_read_until_prompt(int timeout_ms);
+static int cli_wait_for_prompt(int timeout_ms, int max_idle);
 static std::string cli_render_field();
 static std::string mcp_tool_ygo_client(const nlohmann::json& params);
 
@@ -2576,18 +2588,28 @@ static std::string mcp_tool_ygo_choose(const nlohmann::json& params) {
     }
 
     // Network client path: build response bytes, send CTOS_RESPONSE, read on.
+    // The call blocks until input is needed again ("auto-unblock"): if no
+    // prompt is pending we wait for the next one without sending anything,
+    // and after sending a response we wait for the next prompt. So an agent
+    // can connect once and drive the whole game with ygo_choose alone.
     if (net_client_connected && net_client_fd >= 0) {
-        if (!cli_has_prompt) return "Error: no pending prompt (not your turn?)";
         net_client_mode = true;
-        mcp_send_choice(choice_idx, choice_indices);
-        net_client_mode = false;
-        net::write_packet(net_client_fd, CTOS_RESPONSE, net_response_buf.data(), net_response_buf.size());
-        cli_has_prompt = false;
-
         mcp_begin_capture();
-        int r = cli_read_until_prompt(500);
+        int r;
+        if (!cli_has_prompt) {
+            // Not our turn yet (opponent acting, or game not started): wait
+            // for a pending prompt instead of erroring, send no choice.
+            r = cli_wait_for_prompt(5000, 120);
+        } else {
+            mcp_send_choice(choice_idx, choice_indices);
+            net_client_mode = false;
+            net::write_packet(net_client_fd, CTOS_RESPONSE, net_response_buf.data(), net_response_buf.size());
+            cli_has_prompt = false;
+            r = cli_wait_for_prompt(5000, 120);
+        }
         std::string narration = mcp_take_capture();
         mcp_end_capture();
+        net_client_mode = false;
 
         std::ostringstream out;
         if (!narration.empty()) out << narration;
@@ -4632,6 +4654,20 @@ static int cli_read_until_prompt(int timeout_ms) {
         }
         if (proto == STOC_DUEL_END) return 1;
         // other STOC (join/type/hs) — ignore for play
+    }
+}
+
+// Block until a prompt is pending for us, the game ends, or the opponent goes
+// silent for max_idle consecutive timeout windows. Returns like
+// cli_read_until_prompt: 0 = prompt pending (cli_has_prompt), 1 = game over,
+// -1 = idle too long (timeout/disconnect). Packets streaming in while the
+// opponent plays reset the idle counter, so this only trips on true silence.
+static int cli_wait_for_prompt(int timeout_ms, int max_idle) {
+    int idle = 0;
+    while (true) {
+        int r = cli_read_until_prompt(timeout_ms);
+        if (r != -1) return r;
+        if (++idle >= max_idle) return -1;
     }
 }
 

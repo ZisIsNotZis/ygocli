@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ygocli": {
+      "type": "stdio",
+      "command": "/home/z/ygocli/ygocli",
+      "args": [
+        "mcp",
+        "/home/z/ygocli/example.ydk",
+        "/home/z/ygocli/example.ydk"
+      ],
+      "env": {}
+    }
+  }
+}
