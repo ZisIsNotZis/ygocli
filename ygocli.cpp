@@ -52,6 +52,16 @@ public:
 #include "ocgcore/common.h"
 #include "ocgcore/card_data.h"
 
+// gframe-compatible network protocol (vendored, byte-exact)
+#include "network.h"
+#include "net.h"
+
+// gframe structs (HostInfo, STOC_*, CTOS_*) live in namespace ygo
+using namespace ygo;
+
+// gframe protocol version (config.h)
+constexpr uint16_t PRO_VERSION = 0x1362;
+
 // Card database
 std::unordered_map<uint32_t, std::string> card_names;
 std::unordered_map<uint32_t, std::string> card_descs;
@@ -519,6 +529,15 @@ PendingPrompt mcp_pending_prompt;
 bool mcp_game_over = false;
 int mcp_winner = 0;
 int mcp_win_reason = 0;
+
+// Network client state. When net_client_mode is true, mcp_send_choice packs
+// the raw response bytes into net_response_buf instead of calling set_responseb
+// on a local engine; the ygo_client tool then sends them as CTOS_RESPONSE.
+bool net_client_mode = false;
+std::vector<uint8_t> net_response_buf;
+int net_client_fd = -1;          // socket to the server
+int net_client_seat = 0;         // our seat (0 or 1)
+bool net_client_connected = false;
 
 // Important-card tracking: (round, code) mentioned in narration.
 std::deque<std::pair<int, uint32_t>> mcp_important_cards;
@@ -1605,8 +1624,31 @@ int mcp_run_until_pause() {
     }
 }
 
+// Client-side field model: per (player, location, sequence) card.
+// Populated from MSG_UPDATE_DATA / MSG_UPDATE_CARD / MSG_MOVE received from
+// the server; used only for rendering (no local ocgcore).
+struct CliCard {
+    uint32_t code = 0;
+    uint8_t pos = 0;
+    int32_t atk = 0, def = 0;
+    uint32_t level = 0, rank = 0;
+    bool present = false;
+};
+
+// Network client field model (declared here so mcp_query_pos can fall back to
+// it when no in-process engine exists; populated by cli_handle_msg).
+static std::map<std::pair<int,int>, std::vector<CliCard>> cli_field;
+
 // Position byte of the card at (player, loc, seq), 0 if none/not found.
 uint8_t mcp_query_pos(int player, uint32_t loc, int seq) {
+    if (global_pduel == 0) {
+        // Network client mode: no in-process engine. Position comes from the
+        // client-side model (may be stale but avoids a NULL-pduel crash).
+        auto it = cli_field.find({player, (int)(loc & 0xff)});
+        if (it != cli_field.end() && (int)it->second.size() > seq && it->second[seq].present)
+            return it->second[seq].pos;
+        return 0;
+    }
     uint8_t buffer[8192];
     int len = query_field_card(global_pduel, player, loc, QUERY_CODE | QUERY_POSITION, buffer, 0);
     if (len <= 0) return 0;
@@ -1757,14 +1799,15 @@ std::string mcp_build_choices() {
         if (pos & 0x4) out << idx++ << ": Face-up Defense\n";
         if (pos & 0x8) out << idx++ << ": Face-down Defense\n";
     } else if (type == MSG_SELECT_PLACE || type == MSG_SELECT_DISFIELD) {
-        rd8(); // skip player byte
+        int chooser = rd8(); // player who picks
         rd8(); // count
         uint32_t forbidden = rd32();
         uint32_t sel = ~forbidden;
-        for (int i=0;i<7;i++) if (sel & (1u<<i)) out << idx++ << ": P0 MZone["<<i<<"]\n";
-        for (int i=0;i<8;i++) if (sel & (0x100u<<i)) out << idx++ << ": P0 SZone["<<i<<"]\n";
-        for (int i=0;i<7;i++) if (sel & (0x10000u<<i)) out << idx++ << ": P1 MZone["<<i<<"]\n";
-        for (int i=0;i<8;i++) if (sel & (0x1000000u<<i)) out << idx++ << ": P1 SZone["<<i<<"]\n";
+        int opp = 1 - chooser;
+        for (int i=0;i<7;i++) if (sel & (1u<<i)) out << idx++ << ": P" << chooser << " MZone["<<i<<"]\n";
+        for (int i=0;i<8;i++) if (sel & (0x100u<<i)) out << idx++ << ": P" << chooser << " SZone["<<i<<"]\n";
+        for (int i=0;i<7;i++) if (sel & (0x10000u<<i)) out << idx++ << ": P" << opp << " MZone["<<i<<"]\n";
+        for (int i=0;i<8;i++) if (sel & (0x1000000u<<i)) out << idx++ << ": P" << opp << " SZone["<<i<<"]\n";
     } else if (type == MSG_SELECT_SUM) {
         rd8(); // mode (0 or 1)
         rd8(); // skip player byte
@@ -1827,7 +1870,9 @@ std::string mcp_build_choices() {
 // Called after mcp_run_until_pause() returns 0.
 void mcp_send_choice(int choice_idx, const std::vector<int>& choice_indices) {
     intptr_t pduel = global_pduel;
-    if (pduel == 0) return;
+    // Network clients have no in-process engine (global_pduel == 0); they still
+    // need the response bytes built for CTOS_RESPONSE.
+    if (pduel == 0 && !net_client_mode) return;
     int type = mcp_pending_prompt.msg_type;
 
     // Re-read stored data for response construction
@@ -1839,12 +1884,23 @@ void mcp_send_choice(int choice_idx, const std::vector<int>& choice_indices) {
     auto rd32 = [&]() -> uint32_t { uint32_t v=0; if (p+4<=end) std::memcpy(&v,p,4); p+=4; return v; };
 
     auto send_int = [&](int32_t val) {
+        if (net_client_mode) {
+            // network client: pack the int as 4 little-endian bytes
+            net_response_buf.clear();
+            net_response_buf.resize(4);
+            std::memcpy(net_response_buf.data(), &val, 4);
+            return;
+        }
         mcp_last_response.valid = true;
         mcp_last_response.is_buffer = false;
         mcp_last_response.int_val = val;
         set_responsei(pduel, val);
     };
     auto send_buf = [&](const std::vector<uint8_t>& buf) {
+        if (net_client_mode) {
+            net_response_buf = buf;
+            return;
+        }
         mcp_last_response.valid = true;
         mcp_last_response.is_buffer = true;
         mcp_last_response.buf = buf;
@@ -1960,17 +2016,18 @@ void mcp_send_choice(int choice_idx, const std::vector<int>& choice_indices) {
         }
         case MSG_SELECT_PLACE:
         case MSG_SELECT_DISFIELD: {
-            rd8(); // skip player byte
+            int chooser = rd8(); // player who picks
             rd8(); // count
             uint32_t forbidden = rd32();
             uint32_t sel = ~forbidden;
+            int opp = 1 - chooser;
             // Build the same options list as mcp_build_choices
             struct PlaceOpt { uint8_t ctrl,loc,seq; };
             std::vector<PlaceOpt> opts;
-            for (int i=0;i<7;i++) if (sel & (1u<<i)) opts.push_back({0,(uint8_t)LOCATION_MZONE,(uint8_t)i});
-            for (int i=0;i<8;i++) if (sel & (0x100u<<i)) opts.push_back({0,(uint8_t)LOCATION_SZONE,(uint8_t)i});
-            for (int i=0;i<7;i++) if (sel & (0x10000u<<i)) opts.push_back({1,(uint8_t)LOCATION_MZONE,(uint8_t)i});
-            for (int i=0;i<8;i++) if (sel & (0x1000000u<<i)) opts.push_back({1,(uint8_t)LOCATION_SZONE,(uint8_t)i});
+            for (int i=0;i<7;i++) if (sel & (1u<<i)) opts.push_back({(uint8_t)chooser,(uint8_t)LOCATION_MZONE,(uint8_t)i});
+            for (int i=0;i<8;i++) if (sel & (0x100u<<i)) opts.push_back({(uint8_t)chooser,(uint8_t)LOCATION_SZONE,(uint8_t)i});
+            for (int i=0;i<7;i++) if (sel & (0x10000u<<i)) opts.push_back({(uint8_t)opp,(uint8_t)LOCATION_MZONE,(uint8_t)i});
+            for (int i=0;i<8;i++) if (sel & (0x1000000u<<i)) opts.push_back({(uint8_t)opp,(uint8_t)LOCATION_SZONE,(uint8_t)i});
             uint8_t buf[3] = {0, (uint8_t)LOCATION_MZONE, 0};
             if (idx >= 0 && (size_t)idx < opts.size()) {
                 buf[0] = opts[idx].ctrl;
@@ -2104,7 +2161,7 @@ void mcp_send_choice(int choice_idx, const std::vector<int>& choice_indices) {
 }
 
 // ======= MCP JSON-RPC 2.0 server loop =======
-// Handles initialize, tools/list, and tools/call (ygo_start, ygo_choose, ygo_card_search)
+// Handles initialize, tools/list, and tools/call (ygo_single_mode, ygo_client, ygo_choose, ygo_card_search)
 
 // Persistent deck paths for restarting games
 static std::string mcp_deck0_path, mcp_deck1_path;
@@ -2384,7 +2441,7 @@ static void mcp_setup_engine() {
     });
 }
 
-// Initialize a duel (reused by ygo_start and the initial setup)
+// Initialize a duel (reused by ygo_single_mode and the initial setup)
 static bool mcp_init_duel(const std::string& deck0_path, const std::string& deck1_path,
                           int start_lp, int start_hand, int draw_count, int rule) {
     // Clean up existing duel
@@ -2439,8 +2496,8 @@ static bool mcp_init_duel(const std::string& deck0_path, const std::string& deck
     return true;
 }
 
-// ygo_start tool: init new game, run until choice
-static std::string mcp_tool_ygo_start(const nlohmann::json& params) {
+// ygo_single_mode tool: init new game (both players in-process, unfiltered), run until choice
+static std::string mcp_tool_ygo_single_mode(const nlohmann::json& params) {
     // Parse params (each optional with a sensible default)
     std::string deck0 = params.value("deck0", mcp_deck0_path);
     std::string deck1 = params.value("deck1", mcp_deck1_path);
@@ -2472,10 +2529,20 @@ static std::string mcp_tool_ygo_start(const nlohmann::json& params) {
     return mcp_format_output(narration, choices);
 }
 
-// ygo_choose tool: send choice, continue game
-static std::string mcp_tool_ygo_choose(const nlohmann::json& params) {
-    if (global_pduel == 0) return "Error: No active game";
+// Network client field model + state (definitions moved here so the MCP tools
+// can use them; the rendering functions themselves live before main()).
+static int cli_turn = 1;
+static int cli_phase = 0x04;
+static int cli_lp[2] = {8000, 8000};
+static bool cli_has_prompt = false;
+static bool cli_game_over = false;
+static int cli_winner = 0;
+static int cli_read_until_prompt(int timeout_ms);
+static std::string cli_render_field();
+static std::string mcp_tool_ygo_client(const nlohmann::json& params);
 
+// ygo_choose tool: send choice, continue game (solo in-process or network client)
+static std::string mcp_tool_ygo_choose(const nlohmann::json& params) {
     int choice_idx = -1;
     std::vector<int> choice_indices;
     if (params.contains("id") && params["id"].is_number()) choice_idx = params["id"];
@@ -2483,6 +2550,36 @@ static std::string mcp_tool_ygo_choose(const nlohmann::json& params) {
         for (const auto& v : params["indices"])
             if (v.is_number()) choice_indices.push_back(v);
     }
+
+    // Network client path: build response bytes, send CTOS_RESPONSE, read on.
+    if (net_client_connected && net_client_fd >= 0) {
+        if (!cli_has_prompt) return "Error: no pending prompt (not your turn?)";
+        net_client_mode = true;
+        mcp_send_choice(choice_idx, choice_indices);
+        net_client_mode = false;
+        net::write_packet(net_client_fd, CTOS_RESPONSE, net_response_buf.data(), net_response_buf.size());
+        cli_has_prompt = false;
+
+        mcp_begin_capture();
+        int r = cli_read_until_prompt(500);
+        std::string narration = mcp_take_capture();
+        mcp_end_capture();
+
+        std::ostringstream out;
+        if (!narration.empty()) out << narration;
+        out << cli_render_field();
+        if (r == 1) {
+            if (cli_game_over) out << "Game Over: Player " << cli_winner << " wins!\n";
+            else out << "Game Over (duel ended without a winner)\n";
+            return out.str();
+        }
+        if (cli_has_prompt) { out << mcp_build_choices(); return out.str(); }
+        out << "(waiting for opponent or disconnected)\n";
+        return out.str();
+    }
+
+    // Solo in-process path
+    if (global_pduel == 0) return "Error: No active game";
 
     mcp_send_choice(choice_idx, choice_indices);
 
@@ -2545,8 +2642,8 @@ static void mcp_jsonrpc_loop() {
         } else if (method == "tools/list") {
             nlohmann::json tools = nlohmann::json::array();
             tools.push_back({
-                {"name", "ygo_start"},
-                {"description", "Start a new Yu-Gi-Oh! duel. Runs until a choice is needed."},
+                {"name", "ygo_single_mode"},
+                {"description", "Start a solo duel in-process: both players are driven from this session (unfiltered god view). Runs until a choice is needed."},
                 {"inputSchema", {
                     {"type", "object"},
                     {"properties", {
@@ -2561,8 +2658,26 @@ static void mcp_jsonrpc_loop() {
                 }}
             });
             tools.push_back({
+                {"name", "ygo_client"},
+                {"description", "Connect to a ygocli/gframe server as a player. First call joins and uploads your deck; subsequent calls return the next view/prompt. Use ygo_choose to respond. Each side sees only its own filtered view."},
+                {"inputSchema", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"host", {{"type", "string"}, {"description", "Server host (default 127.0.0.1)"}}},
+                        {"port", {{"type", "integer"}, {"description", "Server port (default 7911)"}}},
+                        {"create_game", {{"type", "boolean"}, {"description", "true to create a new game as host (first call)"}}},
+                        {"deck", {{"type", "string"}, {"description", "Path to your .ydk deck"}}},
+                        {"name", {{"type", "string"}, {"description", "Player name"}}},
+                        {"lp", {{"type", "integer"}, {"description", "Starting LP (host, default 8000)"}}},
+                        {"start_hand", {{"type", "integer"}, {"description", "Starting hand (host, default 5)"}}},
+                        {"draw_count", {{"type", "integer"}, {"description", "Draws per turn (host, default 1)"}}},
+                        {"rule", {{"type", "integer"}, {"description", "Master rule (host, default 5)"}}}
+                    }}
+                }}
+            });
+            tools.push_back({
                 {"name", "ygo_choose"},
-                {"description", "Choose an option from the pending prompt and continue the duel."},
+                {"description", "Choose an option from the pending prompt and continue the duel (solo or network)."},
                 {"inputSchema", {
                     {"type", "object"},
                     {"properties", {
@@ -2594,8 +2709,10 @@ static void mcp_jsonrpc_loop() {
             if (!args.is_object()) args = nlohmann::json::object();
 
             std::string tool_result;
-            if (tool_name == "ygo_start") {
-                tool_result = mcp_tool_ygo_start(args);
+            if (tool_name == "ygo_single_mode") {
+                tool_result = mcp_tool_ygo_single_mode(args);
+            } else if (tool_name == "ygo_client") {
+                tool_result = mcp_tool_ygo_client(args);
             } else if (tool_name == "ygo_choose") {
                 tool_result = mcp_tool_ygo_choose(args);
             } else if (tool_name == "ygo_card_search") {
@@ -2624,9 +2741,1453 @@ static void mcp_jsonrpc_loop() {
     }
 }
 
+// ============================================================
+// Network server (gframe-compatible dedicated server)
+// ============================================================
+
+struct ServerPlayer {
+    int fd = -1;
+    uint8_t type = 0xff;           // seat 0/1 (NETPLAYER_TYPE_PLAYER1/2), 0xff = unassigned
+    uint8_t state = 0;             // expected next CTOS_* packet type
+    bool ready = false;
+    bool deck_ok = false;
+    std::vector<uint32_t> deck_main;
+    std::vector<uint32_t> deck_extra;
+    std::vector<uint32_t> deck_side;
+    uint16_t name[20] = {};
+};
+
+static ServerPlayer srv_players[2];
+static int srv_listen_fd = -1;
+static HostInfo srv_host_info;
+static bool srv_started = false;
+static int srv_last_response = -1; // seat that must respond
+static bool srv_duel_abort = false; // a player disconnected -> end the duel
+static int srv_tp_player = 0;      // seat that picks turn after RPS
+static int srv_duel_stage = 0;
+static uint8_t srv_hand_result[2] = {0, 0};
+
+static void srv_send(int seat, uint8_t proto, const uint8_t* data, size_t len) {
+    if (seat < 0 || seat > 1 || srv_players[seat].fd < 0) return;
+    net::write_packet(srv_players[seat].fd, proto, data, len);
+}
+static void srv_send_msg(int seat, const uint8_t* offset, const uint8_t* pbuf) {
+    srv_send(seat, STOC_GAME_MSG, offset, (size_t)(pbuf - offset));
+}
+static void srv_send_msg_both(const uint8_t* offset, const uint8_t* pbuf) {
+    srv_send_msg(0, offset, pbuf);
+    srv_send_msg(1, offset, pbuf);
+}
+static void srv_send_packet(int seat, uint8_t proto) {
+    uint8_t msg = proto;
+    srv_send(seat, STOC_GAME_MSG, &msg, 1);
+}
+
+// Build MSG_UPDATE_DATA (6) for one player+location; sends full info to owner,
+// zeroed hidden segments to the opponent (gframe RefreshMzone/RefreshSzone/...).
+static void srv_refresh_location(int owner, uint32_t location, uint32_t flag, bool reveal_only_owner) {
+    uint8_t qbuf[0x4000];
+    uint8_t* q = qbuf;
+    BufferIO::Write<uint8_t>(q, MSG_UPDATE_DATA);
+    BufferIO::Write<uint8_t>(q, (uint8_t)owner);
+    BufferIO::Write<uint8_t>(q, (uint8_t)location);
+    flag |= (QUERY_CODE | QUERY_POSITION);
+    int len = query_field_card(global_pduel, owner, location, flag, q, 0);
+    if (len <= 0) return;
+    // owner copy: full
+    srv_send_msg(owner, qbuf, q + len);
+    if (reveal_only_owner) {
+        // opponent copy: zero any facedown / hidden segment.
+        // Record layout: int32 clen | uint32 flag | data...
+        // Since WriteUpdateData always adds QUERY_CODE|QUERY_POSITION, the
+        // position value (c + l<<8 + s<<16 + pos<<24) sits at offset 8
+        // (after flag(4) + code(4)).
+        int qlen = 0;
+        uint8_t* qc = q;
+        while (qlen < len) {
+            const int clen = BufferIO::Read<int32_t>(qc);  // qc now at flag
+            qlen += clen;
+            if (clen <= LEN_HEADER) { qc += clen - 4; continue; }
+            uint32_t info = 0;
+            std::memcpy(&info, qc + 8, sizeof info);
+            uint8_t pos = (uint8_t)(info >> 24);
+            bool hide = false;
+            if (location == LOCATION_HAND) {
+                hide = (pos & POS_FACEUP) == 0;
+            } else if (location == LOCATION_MZONE || location == LOCATION_SZONE) {
+                hide = (pos & POS_FACEDOWN) != 0 && (pos & POS_REVEAL) == 0;
+            } else {
+                hide = (pos & POS_FACEDOWN) != 0 && (pos & POS_REVEAL) == 0;
+            }
+            if (hide) std::memset(qc, 0, clen - 4);  // zero flag+data, keep clen
+            qc += clen - 4;  // advance to next record (clen already consumed 4)
+        }
+    }
+    srv_send_msg(1 - owner, qbuf, q + len);
+}
+
+static void srv_refresh_mzone(int owner) { srv_refresh_location(owner, LOCATION_MZONE, QUERY_ATTACK | QUERY_DEFENSE | QUERY_LEVEL | QUERY_RANK | QUERY_TYPE, true); }
+static void srv_refresh_szone(int owner) { srv_refresh_location(owner, LOCATION_SZONE, QUERY_TYPE, true); }
+static void srv_refresh_hand(int owner)  { srv_refresh_location(owner, LOCATION_HAND, QUERY_TYPE, true); }
+static void srv_refresh_grave(int owner) { srv_refresh_location(owner, LOCATION_GRAVE, QUERY_TYPE, false); }
+static void srv_refresh_extra(int owner) { srv_refresh_location(owner, LOCATION_EXTRA, QUERY_TYPE, true); }
+
+// Core message router: gframe single_duel.cpp Analyze() port.
+// Returns: 0 = keep processing, 1 = waiting for a response, 2 = duel over.
+static int srv_analyze(uint8_t* msgbuffer, unsigned int len) {
+    uint8_t* offset;
+    uint8_t* pbuf = msgbuffer;
+    int player, count;
+    while (pbuf - msgbuffer < (int)len) {
+        offset = pbuf;
+        uint8_t engType = BufferIO::Read<uint8_t>(pbuf);
+        switch (engType) {
+        case MSG_RETRY: {
+            if (std::getenv("YGOCLI_MCP_DEBUG"))
+                fprintf(stderr, "srv MSG_RETRY for seat %d\n", srv_last_response);
+            srv_send_packet(srv_last_response, MSG_RETRY);
+            return 1;
+        }
+        case MSG_HINT: {
+            uint8_t type = BufferIO::Read<uint8_t>(pbuf);
+            player = BufferIO::Read<uint8_t>(pbuf);
+            BufferIO::Read<int32_t>(pbuf);
+            switch (type) {
+            case 1: case 2: case 3: case 5:
+                srv_send_msg(player, offset, pbuf); break;
+            case 4: case 6: case 7: case 8: case 9: case 11:
+                srv_send_msg(1 - player, offset, pbuf); break;
+            case 10:
+                srv_send_msg(0, offset, pbuf);
+                srv_send_msg(1, offset, pbuf);
+                break;
+            }
+            break;
+        }
+        case MSG_WIN: {
+            BufferIO::Read<uint8_t>(pbuf); // winner
+            BufferIO::Read<uint8_t>(pbuf); // reason
+            srv_send_msg(0, offset, pbuf);
+            srv_send_msg(1, offset, pbuf);
+            return 2;
+        }
+        case MSG_SELECT_BATTLECMD: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 11;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 8 + 2;
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            srv_refresh_hand(0); srv_refresh_hand(1);
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_IDLECMD: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 7;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 7;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 7;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 7;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 7;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 11 + 3;
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            srv_refresh_hand(0); srv_refresh_hand(1);
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_EFFECTYN: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 12;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_YESNO: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 4;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_OPTION: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 4;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_CARD:
+        case MSG_SELECT_TRIBUTE: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 3;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            for (int i = 0; i < count; ++i) {
+                uint8_t* pbufw = pbuf;
+                BufferIO::Read<int32_t>(pbuf);
+                int c = BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                if (c != player) BufferIO::Write<int32_t>(pbufw, 0); // hide opponent codes
+            }
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_UNSELECT_CARD: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 4;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            for (int i = 0; i < count; ++i) {
+                uint8_t* pbufw = pbuf;
+                BufferIO::Read<int32_t>(pbuf);
+                int c = BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                if (c != player) BufferIO::Write<int32_t>(pbufw, 0);
+            }
+            count = BufferIO::Read<uint8_t>(pbuf);
+            for (int i = 0; i < count; ++i) {
+                uint8_t* pbufw = pbuf;
+                BufferIO::Read<int32_t>(pbuf);
+                int c = BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                BufferIO::Read<uint8_t>(pbuf);
+                if (c != player) BufferIO::Write<int32_t>(pbufw, 0);
+            }
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_CHAIN: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 9 + count * 14;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_PLACE:
+        case MSG_SELECT_DISFIELD: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 5;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_POSITION: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 5;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_COUNTER: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 4;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 9;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SELECT_SUM: {
+            pbuf++;
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 6;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 11;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 11;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_SORT_CARD: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 7;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_CONFIRM_DECKTOP: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 7;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_CONFIRM_EXTRATOP: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 7;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_CONFIRM_CARDS: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 1;
+            count = BufferIO::Read<uint8_t>(pbuf);
+            if (pbuf[5] != LOCATION_DECK) {
+                pbuf += count * 7;
+                srv_send_msg_both(offset, pbuf);
+            } else {
+                pbuf += count * 7;
+                srv_send_msg(player, offset, pbuf);
+            }
+            break;
+        }
+        case MSG_SHUFFLE_DECK: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_SHUFFLE_HAND: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            srv_send_msg(player, offset, pbuf + count * 4);
+            for (int i = 0; i < count; ++i) BufferIO::Write<int32_t>(pbuf, 0);
+            srv_send_msg(1 - player, offset, pbuf);
+            srv_refresh_hand(player);
+            break;
+        }
+        case MSG_SHUFFLE_EXTRA: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            srv_send_msg(player, offset, pbuf + count * 4);
+            for (int i = 0; i < count; ++i) BufferIO::Write<int32_t>(pbuf, 0);
+            srv_send_msg(1 - player, offset, pbuf);
+            srv_refresh_extra(player);
+            break;
+        }
+        case MSG_REFRESH_DECK: {
+            pbuf++;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_SWAP_GRAVE_DECK: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_grave(player);
+            break;
+        }
+        case MSG_REVERSE_DECK:
+            srv_send_msg_both(offset, pbuf);
+            break;
+        case MSG_DECK_TOP: {
+            pbuf += 6;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_SHUFFLE_SET_CARD: {
+            uint8_t loc = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 8;
+            srv_send_msg_both(offset, pbuf);
+            if (loc == LOCATION_MZONE) { srv_refresh_mzone(0); srv_refresh_mzone(1); }
+            else { srv_refresh_szone(0); srv_refresh_szone(1); }
+            break;
+        }
+        case MSG_NEW_TURN: {
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            srv_refresh_hand(0); srv_refresh_hand(1);
+            pbuf++;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_NEW_PHASE: {
+            pbuf += 2;
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            srv_refresh_hand(0); srv_refresh_hand(1);
+            break;
+        }
+        case MSG_MOVE: {
+            uint8_t* pbufw = pbuf;
+            int pc = pbuf[4], pl = pbuf[5], cc = pbuf[8], cl = pbuf[9], cs = pbuf[10];
+            uint8_t cp = pbuf[11];
+            (void)pc; (void)pl;
+            bool hide_code = (cp & POS_FACEDOWN) != 0 && (cp & POS_REVEAL) == 0;
+            if (cl & LOCATION_ONFIELD) {
+                uint32_t info = 0;
+                std::memcpy(&info, pbufw, 4);
+                info &= ~(static_cast<uint32_t>(POS_REVEAL) << 24);
+                std::memcpy(pbufw, &info, 4);
+                cp = (uint8_t)(info >> 24);
+            }
+            pbuf += 16;
+            srv_send_msg(cc, offset, pbuf);
+            if (!(cl & (LOCATION_GRAVE | LOCATION_OVERLAY))
+                    && ((cl & (LOCATION_DECK | LOCATION_HAND)) || hide_code))
+                BufferIO::Write<int32_t>(pbufw, 0);
+            srv_send_msg(1 - cc, offset, pbuf);
+            if (cl != 0 && (cl & LOCATION_OVERLAY) == 0 && (cl != (uint32_t)pl || pc != cc))
+                srv_refresh_location(cc, cl, QUERY_TYPE, true);
+            break;
+        }
+        case MSG_POS_CHANGE: {
+            int cc = pbuf[4], cl = pbuf[5], cs = pbuf[6], pp = pbuf[7], cp = pbuf[8];
+            pbuf += 9;
+            srv_send_msg_both(offset, pbuf);
+            if ((pp & POS_FACEDOWN) && (cp & POS_FACEUP))
+                srv_refresh_location(cc, cl, QUERY_TYPE, true);
+            break;
+        }
+        case MSG_SET: {
+            BufferIO::Write<int32_t>(pbuf, 0);
+            pbuf += 4;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_SWAP: {
+            int c1 = pbuf[4], l1 = pbuf[5], s1 = pbuf[6], c2 = pbuf[12], l2 = pbuf[13], s2 = pbuf[14];
+            pbuf += 16;
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_location(c1, l1, QUERY_TYPE, true);
+            srv_refresh_location(c2, l2, QUERY_TYPE, true);
+            break;
+        }
+        case MSG_FIELD_DISABLED: {
+            pbuf += 4;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_SUMMONING: {
+            pbuf += 8;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_SUMMONED:
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            break;
+        case MSG_SPSUMMONING: {
+            uint8_t* pbufw = pbuf;
+            int cc = pbuf[4];
+            uint8_t cp = pbuf[7];
+            bool hide_code = (cp & POS_FACEDOWN) != 0 && (cp & POS_REVEAL) == 0;
+            uint32_t info = 0;
+            std::memcpy(&info, pbufw, 4);
+            info &= ~(static_cast<uint32_t>(POS_REVEAL) << 24);
+            std::memcpy(pbufw, &info, 4);
+            pbuf += 8;
+            srv_send_msg(cc, offset, pbuf);
+            if (hide_code) BufferIO::Write<int32_t>(pbufw, 0);
+            srv_send_msg(1 - cc, offset, pbuf);
+            break;
+        }
+        case MSG_SPSUMMONED:
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            break;
+        case MSG_FLIPSUMMONING: {
+            srv_refresh_location(pbuf[4], pbuf[5], QUERY_TYPE, true);
+            pbuf += 8;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_FLIPSUMMONED:
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            break;
+        case MSG_CHAINING: {
+            pbuf += 16;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_CHAINED:
+            pbuf++;
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            srv_refresh_hand(0); srv_refresh_hand(1);
+            break;
+        case MSG_CHAIN_SOLVING: {
+            pbuf++;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_CHAIN_SOLVED:
+            pbuf++;
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            srv_refresh_hand(0); srv_refresh_hand(1);
+            break;
+        case MSG_CHAIN_END:
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            srv_refresh_szone(0); srv_refresh_szone(1);
+            srv_refresh_hand(0); srv_refresh_hand(1);
+            break;
+        case MSG_CHAIN_NEGATED:
+        case MSG_CHAIN_DISABLED:
+            pbuf++;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        case MSG_CARD_SELECTED: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 4;
+            break;
+        }
+        case MSG_RANDOM_SELECTED: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 4;
+            srv_send_msg(player, offset, pbuf);
+            srv_send_msg(1 - player, offset, pbuf);
+            break;
+        }
+        case MSG_BECOME_TARGET: {
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count * 4;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_DRAW: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            uint8_t* pbufw = pbuf;
+            pbuf += count * 4;
+            srv_send_msg(player, offset, pbuf);
+            for (int i = 0; i < count; ++i) {
+                if (!(pbufw[3] & 0x80)) BufferIO::Write<int32_t>(pbufw, 0);
+                else pbufw += 4;
+            }
+            srv_send_msg(1 - player, offset, pbuf);
+            break;
+        }
+        case MSG_DAMAGE: case MSG_RECOVER: case MSG_LPUPDATE: case MSG_PAY_LPCOST: {
+            pbuf += 5;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_EQUIP: { pbuf += 8; srv_send_msg_both(offset, pbuf); break; }
+        case MSG_UNEQUIP: { pbuf += 4; srv_send_msg_both(offset, pbuf); break; }
+        case MSG_CARD_TARGET: case MSG_CANCEL_TARGET: {
+            pbuf += 8;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_ADD_COUNTER: case MSG_REMOVE_COUNTER: {
+            pbuf += 7;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_ATTACK: { pbuf += 8; srv_send_msg_both(offset, pbuf); break; }
+        case MSG_BATTLE: { pbuf += 26; srv_send_msg_both(offset, pbuf); break; }
+        case MSG_ATTACK_DISABLED:
+        case MSG_DAMAGE_STEP_START:
+        case MSG_DAMAGE_STEP_END:
+            srv_send_msg_both(offset, pbuf);
+            srv_refresh_mzone(0); srv_refresh_mzone(1);
+            break;
+        case MSG_MISSED_EFFECT: {
+            player = pbuf[0];
+            pbuf += 8;
+            srv_send_msg(player, offset, pbuf);
+            break;
+        }
+        case MSG_TOSS_COIN: case MSG_TOSS_DICE: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += count;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_ROCK_PAPER_SCISSORS: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_HAND_RES: {
+            pbuf += 1;
+            srv_send_msg_both(offset, pbuf);
+            break;
+        }
+        case MSG_ANNOUNCE_RACE: case MSG_ANNOUNCE_ATTRIB: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 5;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_ANNOUNCE_CARD: case MSG_ANNOUNCE_NUMBER: {
+            player = BufferIO::Read<uint8_t>(pbuf);
+            count = BufferIO::Read<uint8_t>(pbuf);
+            pbuf += 4 * count;
+            srv_send_packet(1 - player, MSG_WAITING);
+            srv_last_response = player;
+            srv_send_msg(player, offset, pbuf);
+            return 1;
+        }
+        case MSG_CARD_HINT: { pbuf += 9; srv_send_msg_both(offset, pbuf); break; }
+        case MSG_PLAYER_HINT: { pbuf += 6; srv_send_msg_both(offset, pbuf); break; }
+        default:
+            // unknown message: skip 1 byte (best-effort, keep loop from spinning)
+            fprintf(stderr, "[server] unknown MSG type %d\n", (int)engType);
+            break;
+        }
+    }
+    return 0;
+}
+
+// forward decl (defined below)
+static void srv_await_response();
+
+// Game loop driver: process() until the duel ends, awaiting responses when needed.
+static void srv_game_loop() {
+    uint8_t engine_buf[SIZE_MESSAGE_BUFFER];
+    unsigned int engFlag = 0;
+    int engLen = 0;
+    while (engFlag != PROCESSOR_END) {
+        unsigned int result = process(global_pduel);
+        engLen = (int)(result & PROCESSOR_BUFFER_LEN);
+        engFlag = result & PROCESSOR_FLAG;
+        if (engLen <= 0) continue;
+        get_message(global_pduel, engine_buf);
+        if (std::getenv("YGOCLI_MCP_DEBUG")) {
+            fprintf(stderr, "srv msg 0x%02x len%d:", (int)engine_buf[0], engLen);
+            for (int i = 0; i < engLen && i < 24; ++i) fprintf(stderr, " %02x", engine_buf[i]);
+            fprintf(stderr, "\n");
+        }
+        int stop = srv_analyze(engine_buf, engLen);
+        if (stop == 2) break;             // duel over
+        if (stop == 1) { srv_await_response(); if (srv_duel_abort) break; continue; } // waiting for a response
+    }
+    // duel ended
+    if (std::getenv("YGOCLI_MCP_DEBUG")) {
+        fprintf(stderr, "srv game loop exit engFlag=%u engLen=%d abort=%d\n",
+                engFlag, engLen, (int)srv_duel_abort);
+    }
+}
+
+static int srv_read_packet(int seat, uint8_t* pkt_type, std::vector<uint8_t>& payload, int timeout_ms) {
+    std::vector<uint8_t> buf;
+    int n = net::read_packet(srv_players[seat].fd, buf, timeout_ms);
+    if (n < 0) return -1;
+    *pkt_type = buf[0];
+    payload.assign(buf.begin() + 1, buf.end());
+    return (int)payload.size();
+}
+
+// Send the join sequence to a seated player (gframe JoinGame tail):
+// STOC_JOIN_GAME(HostInfo) + STOC_TYPE_CHANGE + STOC_HS_PLAYER_ENTER for both
+// + STOC_HS_PLAYER_CHANGE ready states.
+static void srv_send_join(int seat) {
+    STOC_JoinGame sjg{};
+    sjg.info = srv_host_info;
+    net::write_packet(srv_players[seat].fd, STOC_JOIN_GAME, (const uint8_t*)&sjg, sizeof(STOC_JoinGame));
+
+    STOC_TypeChange sctc{};
+    sctc.type = (seat == 0 ? 0x10 : 0) | srv_players[seat].type;
+    net::write_packet(srv_players[seat].fd, STOC_TYPE_CHANGE, (const uint8_t*)&sctc, 1);
+
+    for (int p = 0; p < 2; ++p) {
+        STOC_HS_PlayerEnter ent{};
+        std::memcpy(ent.name, srv_players[p].name, sizeof ent.name);
+        ent.pos = (uint8_t)p;
+        net::write_packet(srv_players[seat].fd, STOC_HS_PLAYER_ENTER, (const uint8_t*)&ent, sizeof ent);
+        if (srv_players[p].ready) {
+            STOC_HS_PlayerChange ch{};
+            ch.status = (uint8_t)((p << 4) | PLAYERCHANGE_READY);
+            net::write_packet(srv_players[seat].fd, STOC_HS_PLAYER_CHANGE, (const uint8_t*)&ch, 1);
+        }
+    }
+    STOC_HS_WatchChange wc{};
+    wc.watch_count = 0;
+    net::write_packet(srv_players[seat].fd, STOC_HS_WATCH_CHANGE, (const uint8_t*)&wc, 2);
+}
+
+// Main server: accept 2 players, handshake, then run the duel.
+static int run_server(const std::string& bind_ip, uint16_t port) {
+    srv_listen_fd = net::listen(bind_ip, port);
+    if (srv_listen_fd < 0) { fprintf(stderr, "server: cannot listen on %s:%u\n", bind_ip.c_str(), (unsigned)port); return 1; }
+    fprintf(stderr, "ygocli server listening on %s:%u\n", bind_ip.empty() ? "0.0.0.0" : bind_ip.c_str(), (unsigned)port);
+
+    // Accept players lazily, interleaved with packet processing so a player's
+    // create/join is answered promptly instead of waiting for the 2nd seat.
+    bool host_info_received = false;
+    bool deck_received[2] = {false, false};
+    int host_started = 0;
+
+    while (srv_duel_stage == DUEL_STAGE_BEGIN) {
+        // Accept any pending connection into the first free seat.
+        for (int seat = 0; seat < 2; ++seat) {
+            if (srv_players[seat].fd >= 0) continue;
+            int fd = net::accept(srv_listen_fd);
+            if (fd < 0) break; // no more pending right now
+            srv_players[seat].fd = fd;
+            srv_players[seat].type = (uint8_t)seat;
+            srv_players[seat].state = 0xff;
+            fprintf(stderr, "player %d connected (seat %d)\n", seat, seat);
+        }
+        // If both seats are taken and we never got to handshake them, nothing
+        // to do here; the poll loop below handles their packets.
+
+        // Non-blocking-ish poll: read whichever player has data (short timeout).
+        bool any_activity = false;
+        for (int seat = 0; seat < 2; ++seat) {
+            std::vector<uint8_t> payload;
+            uint8_t pkt = 0;
+            int n = srv_read_packet(seat, &pkt, payload, 50);
+            if (n < 0) continue;
+            any_activity = true;
+            fprintf(stderr, "srv pkt seat%d proto 0x%02x len%d state=0x%02x\n", seat, (int)pkt, n, srv_players[seat].state);
+            // state gate: after joining, expect specific packet types
+            if (srv_players[seat].state != 0xff && srv_players[seat].state != pkt) continue;
+
+            if (pkt == CTOS_PLAYER_INFO && payload.size() >= 40) {
+                std::memcpy(srv_players[seat].name, payload.data(), 40);
+                srv_players[seat].state = 0xff; // next: create/join
+            } else if (pkt == CTOS_CREATE_GAME && payload.size() >= sizeof(HostInfo) + 80) {
+                // Host must live at seat 0 (game loop routes engine player 0
+                // there, and only seat 0 may press start). If the joiner
+                // connected first, swap the seats so the host lands at 0.
+                std::memcpy(&srv_host_info, payload.data(), sizeof(HostInfo));
+                host_info_received = true;
+                if (seat != 0) {
+                    std::swap(srv_players[0], srv_players[seat]);
+                    seat = 0;
+                }
+                srv_players[seat].type = NETPLAYER_TYPE_PLAYER1;
+                srv_players[seat].state = CTOS_UPDATE_DECK;
+                srv_send_join(seat);
+            } else if (pkt == CTOS_JOIN_GAME && payload.size() >= 48) {
+                uint16_t ver;
+                std::memcpy(&ver, payload.data(), 2);
+                if (ver != PRO_VERSION) {
+                    STOC_ErrorMsg err; err.msg = ERRMSG_VERERROR; err.code = PRO_VERSION;
+                    net::write_packet(srv_players[seat].fd, STOC_ERROR_MSG, (const uint8_t*)&err, 8);
+                    net::close(srv_players[seat].fd);
+                    return 1;
+                }
+                srv_players[seat].type = NETPLAYER_TYPE_PLAYER2;
+                srv_players[seat].state = CTOS_UPDATE_DECK;
+                srv_send_join(seat);
+            } else if (pkt == CTOS_UPDATE_DECK) {
+                if (payload.size() < 8) { net::close(srv_players[seat].fd); return 1; }
+                uint32_t mainc, sidec;
+                std::memcpy(&mainc, payload.data(), 4);
+                std::memcpy(&sidec, payload.data() + 4, 4);
+                if ((size_t)(mainc + sidec) > payload.size() / 4) { net::close(srv_players[seat].fd); return 1; }
+                const uint8_t* dp = payload.data() + 8;
+                // Split main vs extra by card type (TYPES_EXTRA_DECK).
+                for (uint32_t i = 0; i < mainc; ++i) {
+                    uint32_t code; std::memcpy(&code, dp + i * 4, 4);
+                    auto it = card_datas.find(code);
+                    bool is_extra = it != card_datas.end() && (it->second.type & TYPES_EXTRA_DECK);
+                    if (is_extra) srv_players[seat].deck_extra.push_back(code);
+                    else srv_players[seat].deck_main.push_back(code);
+                }
+                for (uint32_t i = 0; i < sidec; ++i) {
+                    uint32_t code; std::memcpy(&code, dp + (mainc + i) * 4, 4);
+                    srv_players[seat].deck_side.push_back(code);
+                }
+                if (srv_players[seat].deck_main.size() < 40 || srv_players[seat].deck_main.size() > 60
+                        || srv_players[seat].deck_extra.size() > 15) {
+                    STOC_ErrorMsg err; err.msg = ERRMSG_DECKERROR; err.code = 0;
+                    net::write_packet(srv_players[seat].fd, STOC_ERROR_MSG, (const uint8_t*)&err, 8);
+                    net::close(srv_players[seat].fd);
+                    return 1;
+                }
+                deck_received[seat] = true;
+                srv_players[seat].state = CTOS_HS_READY;
+                fprintf(stderr, "player %d deck ok: %zu main / %zu extra\n", seat,
+                        srv_players[seat].deck_main.size(), srv_players[seat].deck_extra.size());
+            } else if (pkt == CTOS_HS_READY) {
+                if (srv_players[seat].ready) continue;
+                srv_players[seat].ready = true;
+                srv_players[seat].state = 0xff; // open; only host may start
+                fprintf(stderr, "player %d ready\n", seat);
+                // notify both players of the new ready state
+                for (int p = 0; p < 2; ++p) {
+                    STOC_HS_PlayerChange ch{};
+                    ch.status = (uint8_t)((seat << 4) | PLAYERCHANGE_READY);
+                    net::write_packet(srv_players[p].fd, STOC_HS_PLAYER_CHANGE, (const uint8_t*)&ch, 1);
+                }
+            } else if (pkt == CTOS_HS_START) {
+                if (seat != 0) continue;
+                host_started = 1;
+                fprintf(stderr, "host start received\n");
+            }
+        }
+
+        if (host_started && srv_players[0].ready && srv_players[1].ready
+                && deck_received[0] && deck_received[1] && !srv_started) {
+            // Host pressed start: STOC_DUEL_START + deck counts + RPS.
+            net::send_packet(srv_players[0].fd, STOC_DUEL_START);
+            net::send_packet(srv_players[1].fd, STOC_DUEL_START);
+            uint8_t deckbuff[12];
+            uint8_t* dp = deckbuff;
+            BufferIO::Write<uint16_t>(dp, (uint16_t)srv_players[0].deck_main.size());
+            BufferIO::Write<uint16_t>(dp, (uint16_t)srv_players[0].deck_extra.size());
+            BufferIO::Write<uint16_t>(dp, (uint16_t)srv_players[0].deck_side.size());
+            BufferIO::Write<uint16_t>(dp, (uint16_t)srv_players[1].deck_main.size());
+            BufferIO::Write<uint16_t>(dp, (uint16_t)srv_players[1].deck_extra.size());
+            BufferIO::Write<uint16_t>(dp, (uint16_t)srv_players[1].deck_side.size());
+            net::write_packet(srv_players[0].fd, STOC_DECK_COUNT, deckbuff, 12);
+            uint8_t swapped[12];
+            std::memcpy(swapped, deckbuff + 6, 6);
+            std::memcpy(swapped + 6, deckbuff, 6);
+            net::write_packet(srv_players[1].fd, STOC_DECK_COUNT, swapped, 12);
+            srv_duel_stage = DUEL_STAGE_FINGER;
+            srv_players[0].state = CTOS_HAND_RESULT;
+            srv_players[1].state = CTOS_HAND_RESULT;
+            net::send_packet(srv_players[0].fd, STOC_SELECT_HAND);
+            net::send_packet(srv_players[1].fd, STOC_SELECT_HAND);
+            srv_started = true;
+        }
+        if (!any_activity) usleep(1000);
+    }
+
+    // RPS + turn preference
+    while (srv_duel_stage == DUEL_STAGE_FINGER || srv_duel_stage == DUEL_STAGE_FIRSTGO) {
+        for (int seat = 0; seat < 2; ++seat) {
+            std::vector<uint8_t> payload;
+            uint8_t pkt = 0;
+            int n = srv_read_packet(seat, &pkt, payload, 50);
+            if (n < 0) continue;
+            if (pkt == CTOS_HAND_RESULT && srv_duel_stage == DUEL_STAGE_FINGER && payload.size() >= 1) {
+                srv_hand_result[seat] = payload[0];
+                if (srv_hand_result[0] && srv_hand_result[1]) {
+                    STOC_HandResult shr{}; shr.res1 = srv_hand_result[0]; shr.res2 = srv_hand_result[1];
+                    net::write_packet(srv_players[0].fd, STOC_HAND_RESULT, (const uint8_t*)&shr, 2);
+                    shr.res1 = srv_hand_result[1]; shr.res2 = srv_hand_result[0];
+                    net::write_packet(srv_players[1].fd, STOC_HAND_RESULT, (const uint8_t*)&shr, 2);
+                    if (srv_hand_result[0] == srv_hand_result[1]) {
+                        srv_hand_result[0] = srv_hand_result[1] = 0;
+                        net::send_packet(srv_players[0].fd, STOC_SELECT_HAND);
+                        net::send_packet(srv_players[1].fd, STOC_SELECT_HAND);
+                    } else if ((srv_hand_result[0] == 1 && srv_hand_result[1] == 2)
+                            || (srv_hand_result[0] == 2 && srv_hand_result[1] == 3)
+                            || (srv_hand_result[0] == 3 && srv_hand_result[1] == 1)) {
+                        // player 1 wins RPS -> player 1 picks turn
+                        srv_tp_player = 1; srv_duel_stage = DUEL_STAGE_FIRSTGO;
+                        srv_players[1].state = CTOS_TP_RESULT; srv_players[0].state = 0xff;
+                        net::send_packet(srv_players[1].fd, STOC_SELECT_TP);
+                    } else {
+                        srv_tp_player = 0; srv_duel_stage = DUEL_STAGE_FIRSTGO;
+                        srv_players[0].state = CTOS_TP_RESULT; srv_players[1].state = 0xff;
+                        net::send_packet(srv_players[0].fd, STOC_SELECT_TP);
+                    }
+                }
+            } else if (pkt == CTOS_TP_RESULT && srv_duel_stage == DUEL_STAGE_FIRSTGO && payload.size() >= 1) {
+                bool swap = ((payload[0] && seat == 1) || (!payload[0] && seat == 0));
+                srv_duel_stage = DUEL_STAGE_DUELING;
+                // Build the duel now.
+                Deck decks[2];
+                decks[0] = Deck{srv_players[0].deck_main, srv_players[0].deck_extra};
+                decks[1] = Deck{srv_players[1].deck_main, srv_players[1].deck_extra};
+                if (swap) std::swap(decks[0], decks[1]);
+
+                // Shuffle
+                std::mt19937 rng;
+                std::random_device rd;
+                rng.seed(rd());
+                for (int i = 0; i < 2; i++) {
+                    std::shuffle(decks[i].main.begin(), decks[i].main.end(), rng);
+                    std::shuffle(decks[i].extra.begin(), decks[i].extra.end(), rng);
+                }
+                uint32_t seed[SEED_COUNT];
+                for (int i = 0; i < SEED_COUNT; i++) seed[i] = rd();
+
+                mcp_setup_engine();
+                if (global_pduel) { end_duel(global_pduel); global_pduel = 0; }
+                global_pduel = create_duel_v2(seed);
+                set_player_info(global_pduel, 0, srv_host_info.start_lp ? srv_host_info.start_lp : 8000,
+                                srv_host_info.start_hand ? srv_host_info.start_hand : 5,
+                                srv_host_info.draw_count ? srv_host_info.draw_count : 1);
+                set_player_info(global_pduel, 1, srv_host_info.start_lp ? srv_host_info.start_lp : 8000,
+                                srv_host_info.start_hand ? srv_host_info.start_hand : 5,
+                                srv_host_info.draw_count ? srv_host_info.draw_count : 1);
+                for (int i = 0; i < 2; i++) {
+                    for (size_t j = 0; j < decks[i].main.size(); j++)
+                        new_card(global_pduel, decks[i].main[j], i, i, LOCATION_DECK, decks[i].main.size() - 1 - j, POS_FACEDOWN_DEFENSE);
+                    for (size_t j = 0; j < decks[i].extra.size(); j++)
+                        new_card(global_pduel, decks[i].extra[j], i, i, LOCATION_EXTRA, j, POS_FACEDOWN_DEFENSE);
+                }
+                int rule = srv_host_info.duel_rule ? srv_host_info.duel_rule : CURRENT_RULE;
+                // MSG_START (hand-built, per gframe)
+                uint8_t startbuf[32]{};
+                uint8_t* sp = startbuf;
+                BufferIO::Write<uint8_t>(sp, MSG_START);
+                BufferIO::Write<uint8_t>(sp, 0);
+                BufferIO::Write<uint8_t>(sp, (uint8_t)rule);
+                BufferIO::Write<int32_t>(sp, srv_host_info.start_lp ? srv_host_info.start_lp : 8000);
+                BufferIO::Write<int32_t>(sp, srv_host_info.start_lp ? srv_host_info.start_lp : 8000);
+                BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 0, LOCATION_DECK));
+                BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 0, LOCATION_EXTRA));
+                BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 1, LOCATION_DECK));
+                BufferIO::Write<uint16_t>(sp, (uint16_t)query_field_count(global_pduel, 1, LOCATION_EXTRA));
+                int seat0_first = swap ? 1 : 0;
+                srv_send(seat0_first, STOC_GAME_MSG, startbuf, 19);
+                startbuf[1] = 1;
+                srv_send(1 - seat0_first, STOC_GAME_MSG, startbuf, 19);
+                srv_refresh_extra(0);
+                srv_refresh_extra(1);
+                uint32_t opt = (uint32_t)rule << 16;
+                start_duel(global_pduel, opt);
+                srv_game_loop();
+                // After game loop: notify end
+                srv_duel_stage = DUEL_STAGE_END;
+                net::send_packet(srv_players[0].fd, STOC_DUEL_END);
+                net::send_packet(srv_players[1].fd, STOC_DUEL_END);
+                if (global_pduel) { end_duel(global_pduel); global_pduel = 0; }
+                net::close(srv_players[0].fd);
+                net::close(srv_players[1].fd);
+                net::close(srv_listen_fd);
+                return 0;
+            }
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+// Receive a response from the expected player and feed it into the engine.
+// Called after srv_game_loop() returns 1 (waiting).
+static void srv_await_response() {
+    while (srv_last_response >= 0) {
+        int seat = srv_last_response;
+        std::vector<uint8_t> payload;
+        uint8_t pkt = 0;
+        int n = srv_read_packet(seat, &pkt, payload, -1);
+        if (n < 0) {
+            fprintf(stderr, "server: player %d disconnected\n", seat);
+            net::close(srv_players[seat].fd);
+            srv_players[seat].fd = -1;
+            srv_duel_abort = true;
+            srv_last_response = -1;
+            return;
+        }
+        if (std::getenv("YGOCLI_MCP_DEBUG")) {
+            fprintf(stderr, "srv resp seat%d proto 0x%02x len%d\n", seat, (int)pkt, n);
+            fprintf(stderr, "  bytes:");
+            for (uint8_t b : payload) fprintf(stderr, " %02x", b);
+            fprintf(stderr, "\n");
+        }
+        if (pkt == CTOS_RESPONSE) {
+            uint8_t resb[SIZE_RETURN_VALUE]{};
+            size_t rlen = payload.size() > SIZE_RETURN_VALUE ? SIZE_RETURN_VALUE : payload.size();
+            std::memcpy(resb, payload.data(), rlen);
+            set_responseb(global_pduel, resb);
+            srv_players[seat].state = 0xff;
+            srv_game_loop();
+            if (srv_duel_abort) return;
+            continue;
+        }
+        if (pkt == CTOS_SURRENDER) {
+            fprintf(stderr, "player %d surrendered\n", seat);
+            net::close(srv_players[seat].fd);
+            srv_players[seat].fd = -1;
+            srv_duel_abort = true;
+            srv_last_response = -1;
+            return;
+        }
+    }
+}
+
+// ============================================================
+// Network client (MCP tool ygo_client) — thin renderer
+// ============================================================
+
+static void cli_clear_field() { cli_field.clear(); cli_has_prompt = false; cli_game_over = false; }
+
+// Parse one query record (from MSG_UPDATE_DATA payload) into a CliCard.
+static void cli_parse_record(uint8_t*& p, uint8_t* end, CliCard& out) {
+    out = CliCard();
+    if (p + 8 > end) return;
+    int32_t clen = BufferIO::Read<int32_t>(p);
+    if (clen < 8 || p + (clen - 4) > end) { p = end; return; }
+    uint8_t* rec_end = p + (clen - 4);
+    int32_t flag = BufferIO::Read<int32_t>(p);
+    if (flag & QUERY_CODE) { out.code = BufferIO::Read<uint32_t>(p); }
+    if (flag & QUERY_POSITION) { uint32_t il = BufferIO::Read<uint32_t>(p); out.pos = (il >> 24) & 0xff; }
+    if (flag & QUERY_ALIAS) { BufferIO::Read<uint32_t>(p); }
+    if (flag & QUERY_TYPE) { BufferIO::Read<uint32_t>(p); }
+    if (flag & QUERY_LEVEL) { out.level = BufferIO::Read<uint32_t>(p); }
+    if (flag & QUERY_RANK) { out.rank = BufferIO::Read<uint32_t>(p); }
+    if (flag & QUERY_ATTRIBUTE) { BufferIO::Read<uint32_t>(p); }
+    if (flag & QUERY_RACE) { BufferIO::Read<uint32_t>(p); }
+    if (flag & QUERY_ATTACK) { out.atk = BufferIO::Read<int32_t>(p); }
+    if (flag & QUERY_DEFENSE) { out.def = BufferIO::Read<int32_t>(p); }
+    out.present = (out.code != 0);
+    p = rec_end;
+}
+
+// Handle a single MSG_* from the STOC_GAME_MSG stream, updating the field model
+// and (for prompts) storing the prompt. Returns 0=continue, 1=prompt stored,
+// 2=game over.
+static int cli_handle_msg(uint8_t*& p, uint8_t* end) {
+    uint8_t msg = BufferIO::Read<uint8_t>(p);
+    switch (msg) {
+    case MSG_UPDATE_DATA: {
+        int player = BufferIO::Read<uint8_t>(p);
+        int loc = BufferIO::Read<uint8_t>(p);
+        auto& vec = cli_field[{player, loc}];
+        vec.clear();
+        while (p < end) {
+            uint8_t* rec = p;
+            if (p + 4 > end) break;
+            int32_t clen = BufferIO::Read<int32_t>(p);
+            if (clen <= 4) continue;  // empty slot (clen==4): skip, keep stream in sync
+            p = rec; // rewind; parse_record reads clen itself
+            CliCard c;
+            cli_parse_record(p, end, c);
+            if (!c.present && vec.empty()) continue; // empty slot
+            vec.push_back(c);
+        }
+        // Note: empty slots are skipped; seq used for rendering only.
+        break;
+    }
+    case MSG_UPDATE_CARD: {
+        int player = BufferIO::Read<uint8_t>(p);
+        int loc = BufferIO::Read<uint8_t>(p);
+        int seq = BufferIO::Read<uint8_t>(p);
+        CliCard c;
+        cli_parse_record(p, end, c);
+        auto& vec = cli_field[{player, loc}];
+        if ((int)vec.size() <= seq) vec.resize(seq + 1);
+        vec[seq] = c;
+        break;
+    }
+    case MSG_MOVE: {
+        uint32_t code = BufferIO::Read<uint32_t>(p);
+        uint32_t prev = BufferIO::Read<uint32_t>(p);
+        uint32_t nw = BufferIO::Read<uint32_t>(p);
+        BufferIO::Read<uint32_t>(p); // reason
+        int pc = prev & 0xff, pl = (prev >> 8) & 0xff, ps = (prev >> 16) & 0xff;
+        int nc = nw & 0xff, nl = (nw >> 8) & 0xff, ns = (nw >> 16) & 0xff;
+        uint8_t pos = (nw >> 24) & 0xff;
+        // remove from old location
+        auto it = cli_field.find({pc, pl});
+        if (it != cli_field.end() && (int)it->second.size() > ps) it->second[ps] = CliCard();
+        // insert into new location
+        auto& v = cli_field[{nc, nl}];
+        if ((int)v.size() <= ns) v.resize(ns + 1);
+        CliCard c; c.code = code; c.pos = pos; c.present = true;
+        v[ns] = c;
+        break;
+    }
+    case MSG_NEW_TURN: { BufferIO::Read<uint8_t>(p); cli_turn++; break; }
+    case MSG_NEW_PHASE: { cli_phase = BufferIO::Read<uint16_t>(p); break; }
+    case MSG_LPUPDATE: {
+        int pl = BufferIO::Read<uint8_t>(p);
+        cli_lp[pl] = BufferIO::Read<int32_t>(p);
+        break;
+    }
+    case MSG_DAMAGE: {
+        int pl = BufferIO::Read<uint8_t>(p);
+        cli_lp[pl] -= BufferIO::Read<int32_t>(p);
+        break;
+    }
+    case MSG_RECOVER: {
+        int pl = BufferIO::Read<uint8_t>(p);
+        cli_lp[pl] += BufferIO::Read<int32_t>(p);
+        break;
+    }
+    case MSG_WIN: {
+        cli_winner = BufferIO::Read<uint8_t>(p);
+        BufferIO::Read<uint8_t>(p);
+        cli_game_over = true;
+        return 2;
+    }
+    case MSG_RETRY: {
+        // engine rejected the previous response; re-surface the stored prompt
+        cli_has_prompt = true;
+        return 1;
+    }
+    default: {
+        // Prompt messages: store raw payload for choice building.
+        // The stored prompt is the REMAINING bytes of this STOC_GAME_MSG packet
+        // (the server sends a prompt as the last message in its packet).
+        bool is_prompt = false;
+        switch (msg) {
+        case MSG_SELECT_BATTLECMD: case MSG_SELECT_IDLECMD: case MSG_SELECT_EFFECTYN:
+        case MSG_SELECT_YESNO: case MSG_SELECT_OPTION: case MSG_SELECT_CARD:
+        case MSG_SELECT_CHAIN: case MSG_SELECT_PLACE: case MSG_SELECT_POSITION:
+        case MSG_SELECT_TRIBUTE: case MSG_SELECT_COUNTER: case MSG_SELECT_SUM:
+        case MSG_SELECT_DISFIELD: case MSG_SORT_CARD: case MSG_SELECT_UNSELECT_CARD:
+        case MSG_ROCK_PAPER_SCISSORS: case MSG_ANNOUNCE_RACE: case MSG_ANNOUNCE_ATTRIB:
+        case MSG_ANNOUNCE_CARD: case MSG_ANNOUNCE_NUMBER:
+            is_prompt = true;
+            break;
+        default: break;
+        }
+        if (is_prompt) {
+            uint8_t player = (p < end) ? *p : 0;
+            mcp_store_prompt_raw(msg, player, p, (size_t)(end - p));
+            cli_has_prompt = true;
+            return 1;
+        }
+        // Informational: advance past the exact payload so the stream stays
+        // in sync (mirrors the server's srv_analyze skip lengths).
+        switch (msg) {
+        case MSG_START: {
+            // gframe MSG_START: player(1) rule(1) lp0(4) lp1(4) deck0(2) extra0(2) deck1(2) extra1(2)
+            BufferIO::Read<uint8_t>(p); // player
+            BufferIO::Read<uint8_t>(p); // rule
+            cli_lp[0] = BufferIO::Read<int32_t>(p);
+            cli_lp[1] = BufferIO::Read<int32_t>(p);
+            uint16_t d0 = BufferIO::Read<uint16_t>(p);
+            uint16_t e0 = BufferIO::Read<uint16_t>(p);
+            uint16_t d1 = BufferIO::Read<uint16_t>(p);
+            BufferIO::Read<uint16_t>(p); // extra1
+            cli_field[{0, LOCATION_DECK}].assign(d0, CliCard{});
+            cli_field[{1, LOCATION_DECK}].assign(d1, CliCard{});
+            cli_field[{0, LOCATION_EXTRA}].assign(e0, CliCard{});
+            if (std::getenv("YGOCLI_MCP_DEBUG"))
+                fprintf(stderr, "cli MSG_START parsed lp0=%d lp1=%d d0=%d e0=%d d1=%d\n", cli_lp[0], cli_lp[1], d0, e0, d1);
+            break;
+        }
+        case MSG_HINT: { uint8_t t=BufferIO::Read<uint8_t>(p); uint8_t pl=BufferIO::Read<uint8_t>(p); BufferIO::Read<uint32_t>(p); (void)t;(void)pl; break; }
+        case MSG_CONFIRM_DECKTOP:
+        case MSG_CONFIRM_EXTRATOP: { BufferIO::Read<uint8_t>(p); uint8_t c=BufferIO::Read<uint8_t>(p); p += c*7; break; }
+        case MSG_CONFIRM_CARDS: { BufferIO::Read<uint8_t>(p); BufferIO::Read<uint8_t>(p); uint8_t c=BufferIO::Read<uint8_t>(p); p += c*7; break; }
+        case MSG_SHUFFLE_DECK: BufferIO::Read<uint8_t>(p); break;
+        case MSG_SHUFFLE_HAND:
+        case MSG_SHUFFLE_EXTRA: { BufferIO::Read<uint8_t>(p); uint8_t c=BufferIO::Read<uint8_t>(p); p += c*4; break; }
+        case MSG_SWAP_GRAVE_DECK: BufferIO::Read<uint8_t>(p); break;
+        case MSG_REVERSE_DECK: break;
+        case MSG_DECK_TOP: p += 6; break;
+        case MSG_SHUFFLE_SET_CARD: { BufferIO::Read<uint8_t>(p); uint8_t c=BufferIO::Read<uint8_t>(p); p += c*8; break; }
+        case MSG_POS_CHANGE: p += 9; break;
+        case MSG_SET: p += 4; break;
+        case MSG_SWAP: p += 16; break;
+        case MSG_FIELD_DISABLED: p += 4; break;
+        case MSG_SUMMONING:
+        case MSG_SPSUMMONING:
+        case MSG_FLIPSUMMONING: p += 8; break;
+        case MSG_SUMMONED: case MSG_SPSUMMONED: case MSG_FLIPSUMMONED: break;
+        case MSG_CHAINING: p += 16; break;
+        case MSG_CHAINED: case MSG_CHAIN_SOLVING: case MSG_CHAIN_SOLVED:
+        case MSG_CHAIN_NEGATED: case MSG_CHAIN_DISABLED: p += 1; break;
+        case MSG_CHAIN_END: break;
+        case MSG_CARD_SELECTED: { BufferIO::Read<uint8_t>(p); uint8_t c=BufferIO::Read<uint8_t>(p); p += c*4; break; }
+        case MSG_RANDOM_SELECTED: { BufferIO::Read<uint8_t>(p); uint8_t c=BufferIO::Read<uint8_t>(p); p += c*4; break; }
+        case MSG_BECOME_TARGET: { uint8_t c=BufferIO::Read<uint8_t>(p); p += c*4; break; }
+        case MSG_DRAW: {
+            int pl = BufferIO::Read<uint8_t>(p);
+            uint8_t c = BufferIO::Read<uint8_t>(p);
+            p += c*4;
+            auto& dv = cli_field[{pl, LOCATION_DECK}];
+            if ((int)dv.size() >= c) dv.resize(dv.size() - c); else dv.clear();
+            break;
+        }
+        case MSG_DAMAGE: case MSG_RECOVER: case MSG_LPUPDATE:
+        case MSG_PAY_LPCOST: p += 5; break;
+        case MSG_EQUIP: p += 8; break;
+        case MSG_UNEQUIP: p += 4; break;
+        case MSG_CARD_TARGET: case MSG_CANCEL_TARGET: p += 8; break;
+        case MSG_ADD_COUNTER: case MSG_REMOVE_COUNTER: p += 7; break;
+        case MSG_ATTACK: p += 8; break;
+        case MSG_BATTLE: p += 26; break;
+        case MSG_ATTACK_DISABLED: case MSG_DAMAGE_STEP_START: case MSG_DAMAGE_STEP_END: break;
+        case MSG_MISSED_EFFECT: p += 8; break;
+        case MSG_TOSS_COIN: case MSG_TOSS_DICE: { BufferIO::Read<uint8_t>(p); uint8_t c=BufferIO::Read<uint8_t>(p); p += c; break; }
+        case MSG_HAND_RES: p += 1; break;
+        case MSG_CARD_HINT: p += 9; break;
+        case MSG_PLAYER_HINT: p += 6; break;
+        case MSG_UPDATE_DATA: case MSG_UPDATE_CARD: case MSG_MOVE: break; // handled above
+        default: break; // unknown: cannot skip reliably
+        }
+        break;
+    }
+    }
+    return 0;
+}
+
+// Process one STOC_GAME_MSG packet payload (a concatenated MSG_* stream).
+static int cli_process_game_msg(uint8_t* data, size_t len) {
+    uint8_t* p = data;
+    uint8_t* end = data + len;
+    int last = 0;
+    while (p < end) {
+        last = cli_handle_msg(p, end);
+        if (last != 0) break;
+    }
+    return last;
+}
+
+// Receive STOC packets until we have a prompt or game over or timeout.
+// Handles pre-duel handshake: STOC_SELECT_HAND (RPS) and STOC_SELECT_TP.
+// Returns 0 if a prompt is pending (cli_has_prompt), 1 game over, -1 waiting/timeout.
+static int cli_read_until_prompt(int timeout_ms) {
+    std::vector<uint8_t> buf;
+    while (true) {
+        int n = net::read_packet(net_client_fd, buf, timeout_ms);
+        if (n < 0) return -1;               // timeout / disconnected
+        if (buf.empty()) return -1;
+        uint8_t proto = buf[0];
+        const uint8_t* payload = buf.data() + 1;
+        size_t plen = buf.size() - 1;
+        if (proto == STOC_GAME_MSG && plen > 0) {
+            if (std::getenv("YGOCLI_MCP_DEBUG")) {
+                fprintf(stderr, "cli GAME_MSG len%zu:", plen);
+                for (size_t i = 0; i < plen && i < 40; ++i) fprintf(stderr, " %02x", (unsigned)payload[i]);
+                fprintf(stderr, "\n");
+            }
+            int r = cli_process_game_msg(const_cast<uint8_t*>(payload), plen);
+            if (r == 1) return 0;           // prompt pending
+            if (r == 2) return 1;           // game over
+            continue;
+        }
+        if (proto == STOC_SELECT_HAND) {
+            // auto rock/paper/scissors: seat-dependent value
+            uint8_t res = (uint8_t)((net_client_seat == 0) ? 1 : 2);
+            std::vector<uint8_t> rr = {res};
+            net::write_packet(net_client_fd, CTOS_HAND_RESULT, rr.data(), 1);
+            continue;
+        }
+        if (proto == STOC_SELECT_TP) {
+            std::vector<uint8_t> tp = {0};
+            net::write_packet(net_client_fd, CTOS_TP_RESULT, tp.data(), 1);
+            continue;
+        }
+        if (proto == STOC_DUEL_END) return 1;
+        // other STOC (join/type/hs) — ignore for play
+    }
+}
+
+// Render the field from the model (per player, from our seat's perspective).
+static std::string cli_render_field() {
+    std::ostringstream out;
+    out << "=== Turn " << cli_turn << " Phase " << phase_name(cli_phase) << " ===\n";
+    for (int pl = 0; pl < 2; ++pl) {
+        out << "P" << pl << " LP:" << cli_lp[pl];
+        out << " Deck:" << (int)(cli_field[{pl, LOCATION_DECK}].size())
+            << " Extra:" << (int)(cli_field[{pl, LOCATION_EXTRA}].size()) << "\n";
+        auto loc_str = [&](int loc, const char* label, bool names) {
+            auto it = cli_field.find({pl, loc});
+            std::vector<CliCard> vec = (it == cli_field.end()) ? std::vector<CliCard>() : it->second;
+            bool onfield = (loc == LOCATION_MZONE || loc == LOCATION_SZONE);
+            bool any = false;
+            std::ostringstream s;
+            for (size_t i = 0; i < vec.size(); ++i) {
+                if (!vec[i].present) continue;
+                if (any) s << ", ";
+                any = true;
+                if (onfield) s << "[" << i << "] ";
+                if (names && vec[i].code) {
+                    s << get_card_name(vec[i].code);
+                    if (loc == LOCATION_MZONE) {
+                        s << " " << pos_name(vec[i].pos);
+                        s << mcp_lv_label(vec[i].code, vec[i].level, vec[i].rank);
+                        s << " " << vec[i].atk << "/" << vec[i].def;
+                    } else if (loc == LOCATION_SZONE) {
+                        s << " " << st_pos_label(vec[i].pos);
+                    }
+                } else if (onfield) {
+                    s << "set";
+                } else {
+                    s << "?";
+                }
+            }
+            out << "  " << label << ": " << (any ? s.str() : "-") << "\n";
+        };
+        loc_str(LOCATION_HAND, "Hand", true);
+        loc_str(LOCATION_MZONE, "MZone", true);
+        loc_str(LOCATION_SZONE, "SZone", true);
+        loc_str(LOCATION_GRAVE, "Grave", true);
+        loc_str(LOCATION_REMOVED, "Removed", true);
+    }
+    return out.str();
+}
+
+// Connect + handshake to the server. Returns 0 on success.
+static int cli_connect_and_join(const std::string& host, uint16_t port,
+                                bool create_game, const std::string& deck_path,
+                                const std::string& name, int lp, int start_hand, int draw_count, int rule) {
+    net_client_fd = net::connect(host, port);
+    if (net_client_fd < 0) return -1;
+    net_client_connected = true;
+
+    // CTOS_PLAYER_INFO
+    std::vector<uint8_t> ni(40, 0);
+    for (size_t i = 0; i < name.size() && i < 20; ++i) {
+        // UTF-16LE per gframe; write narrow chars into low bytes (ASCII names)
+        ni[i * 2] = (uint8_t)name[i];
+    }
+    net::write_packet(net_client_fd, CTOS_PLAYER_INFO, ni.data(), 40);
+
+    // load deck
+    Deck deck = load_deck(deck_path);
+    if (deck.main.empty() && deck.extra.empty()) return -1;
+
+    if (create_game) {
+        HostInfo hi{};
+        hi.rule = rule;
+        hi.mode = 0;
+        hi.duel_rule = (uint8_t)rule;
+        hi.no_check_deck = 0;
+        hi.no_shuffle_deck = 0;
+        hi.start_lp = lp;
+        hi.start_hand = (uint8_t)start_hand;
+        hi.draw_count = (uint8_t)draw_count;
+        hi.time_limit = 0;
+        std::vector<uint8_t> cg(sizeof(CTOS_CreateGame), 0);
+        std::memcpy(cg.data(), &hi, sizeof(HostInfo));
+        for (size_t i = 0; i < name.size() && i < 20; ++i) cg[sizeof(HostInfo) + i * 2] = (uint8_t)name[i];
+        net::write_packet(net_client_fd, CTOS_CREATE_GAME, cg.data(), cg.size());
+    } else {
+        std::vector<uint8_t> jg(sizeof(CTOS_JoinGame), 0);
+        uint16_t ver = PRO_VERSION;
+        std::memcpy(jg.data(), &ver, 2);
+        net::write_packet(net_client_fd, CTOS_JOIN_GAME, jg.data(), jg.size());
+    }
+
+    // read STOC_JOIN_GAME + STOC_TYPE_CHANGE to learn our seat
+    std::vector<uint8_t> buf;
+    bool got_type = false;
+    while (!got_type) {
+        int n = net::read_packet(net_client_fd, buf, 3000);
+        if (n < 0) return -1;
+        if (buf.empty()) return -1;
+        if (buf[0] == STOC_TYPE_CHANGE && n >= 1) {
+            net_client_seat = buf[1] & 0x0f;  // low nibble = seat
+            if (buf[1] & 0x10) create_game = true;
+            got_type = true;
+        }
+    }
+
+    // upload deck (main+extra as one list; server splits by type)
+    std::vector<uint8_t> dk;
+    auto push = [&](const std::vector<uint32_t>& v) {
+        uint32_t c = (uint32_t)v.size();
+        uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4);
+    };
+    // mainc = main.size()+extra.size(); sidec = 0
+    uint32_t mainc = (uint32_t)(deck.main.size() + deck.extra.size());
+    uint32_t sidec = 0;
+    uint8_t hdr[8]; std::memcpy(hdr, &mainc, 4); std::memcpy(hdr + 4, &sidec, 4);
+    dk.insert(dk.end(), hdr, hdr + 8);
+    for (uint32_t c : deck.main) { uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4); }
+    for (uint32_t c : deck.extra) { uint8_t b[4]; std::memcpy(b, &c, 4); dk.insert(dk.end(), b, b + 4); }
+    net::write_packet(net_client_fd, CTOS_UPDATE_DECK, dk.data(), dk.size());
+
+    // ready
+    net::send_packet(net_client_fd, CTOS_HS_READY);
+    // Host auto-starts once both players are seated (server waits for both ready).
+    if (create_game) {
+        // wait a moment for the joiner to connect, then send HS_START
+        std::vector<uint8_t> hb;
+        int t0 = 0;
+        while (t0 < 8000) {
+            int n = net::read_packet(net_client_fd, hb, 200);
+            if (n < 0) { t0 += 200; continue; }
+            if (hb.empty()) { t0 += 200; continue; }
+            // HS_PLAYER_CHANGE with the joiner's READY -> start
+            if (hb[0] == STOC_HS_PLAYER_CHANGE) { net::send_packet(net_client_fd, CTOS_HS_START); break; }
+        }
+    }
+    return 0;
+}
+
+// ygo_client MCP tool: connect/join, then read until our prompt or "waiting".
+static std::string mcp_tool_ygo_client(const nlohmann::json& params) {
+    if (!net_client_connected || net_client_fd < 0) {
+        std::string host = params.value("host", "127.0.0.1");
+        int port = params.value("port", 7911);
+        bool create = params.value("create_game", false);
+        std::string deck = params.value("deck", mcp_deck0_path);
+        std::string name = params.value("name", "ygocli");
+        int lp = params.value("lp", 8000);
+        int hand = params.value("start_hand", 5);
+        int draw = params.value("draw_count", 1);
+        int rule = params.value("rule", CURRENT_RULE);
+        if (cli_connect_and_join(host, port, create, deck, name, lp, hand, draw, rule) != 0)
+            return "Error: cannot connect to server";
+        cli_clear_field();
+    }
+
+    net_client_mode = true;
+    mcp_begin_capture();
+    // Poll with a short timeout so the tool never blocks forever: if the
+    // opponent hasn't acted yet, return "waiting" and the agent re-calls.
+    int r = cli_read_until_prompt(500);
+    std::string narration = mcp_take_capture();
+    mcp_end_capture();
+    net_client_mode = false;
+
+    std::ostringstream out;
+    if (!narration.empty()) out << narration;
+    out << cli_render_field();
+    if (r == 1) {
+        if (cli_game_over) out << "Game Over: Player " << cli_winner << " wins!\n";
+        else out << "Game Over (duel ended without a winner)\n";
+        return out.str();
+    }
+    // Surface a pending prompt even if the last read timed out (a prompt may
+    // have been stored by an earlier read that consumed a whole prompt packet).
+    if (cli_has_prompt) { out << mcp_build_choices(); return out.str(); }
+    out << "(waiting for opponent or disconnected)\n";
+    return out.str();
+}
+
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
+    // Dedicated network server subcommand: ygocli server [--port N] [--bind ip]
+    if (argc >= 2 && std::string(argv[1]) == "server") {
+        std::string bind_ip = "0.0.0.0";
+        uint16_t port = 7911;
+        for (int i = 2; i < argc; i++) {
+            if (std::string(argv[i]) == "--port" && i + 1 < argc) {
+                port = (uint16_t)std::strtoul(argv[i + 1], nullptr, 10);
+                i++;
+            } else if (std::string(argv[i]) == "--bind" && i + 1 < argc) {
+                bind_ip = argv[i + 1];
+                i++;
+            }
+        }
+        load_card_database("./cards.cdb");
+        load_strings_conf("./strings.conf");
+        return run_server(bind_ip, port);
+    }
+
+    // --mcp works with no deck args (decks arrive via ygo_client params).
+    bool wants_mcp = false;
+    for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--mcp") wants_mcp = true;
+
+    if (argc < 3 && !wants_mcp) {
         std::cerr << "Usage: " << argv[0] << " <deck0.ydk> <deck1.ydk> [--auto]\n";
+        std::cerr << "       " << argv[0] << " server [--port N] [--bind ip]\n";
+        std::cerr << "       " << argv[0] << " --mcp\n";
         return 1;
     }
 
