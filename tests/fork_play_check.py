@@ -38,6 +38,10 @@ class MCP:
         r = self.rpc("tools/call", {"name": "ygo_choose", "arguments": args})
         return r["result"]["content"][0]["text"]
 
+    def state(self):
+        r = self.rpc("tools/call", {"name": "ygo_state", "arguments": {}})
+        return r["result"]["content"][0]["text"]
+
     def kill(self):
         self.proc.kill(); self.proc.wait()
 
@@ -56,7 +60,7 @@ try:
     # lobby
     for m in (a, b):
         for _ in range(20):
-            t = m.choose(id=-1)
+            t = m.state()
             if "ready" in t:
                 break
             time.sleep(0.5)
@@ -69,7 +73,7 @@ try:
     host_started = False
     while time.time() - t0 < 75:
         for m, v in ((a, 1), (b, 2)):
-            t = m.choose(id=-1)
+            t = m.state()
             s = status(t)
             if s: samples.append(s)
             if "start duel" in t and not host_started:
