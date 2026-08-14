@@ -62,26 +62,21 @@ try:
             time.sleep(0.5)
         print("lobby", m.name, repr((t or "")[:80]))
     a.choose(id=0); b.choose(id=0)   # ready
-    time.sleep(2)
-    # start by host
-    for _ in range(20):
-        t = a.choose(id=-1)
-        if "start duel" in t:
-            a.choose(id=1)
-            started = True
-            break
-        time.sleep(0.5)
-    if not started:
-        print("FAIL: never got the start option")
-        sys.exit(1)
+    # The srvpro room auto-starts the duel once both players are ready; the
+    # host's "start duel" button is a fallback if the auto-start is delayed.
     t0 = time.time()
     game_over = False
+    host_started = False
     while time.time() - t0 < 75:
         for m, v in ((a, 1), (b, 2)):
             t = m.choose(id=-1)
             s = status(t)
             if s: samples.append(s)
-            if "RPS choice" in t:
+            if "start duel" in t and not host_started:
+                m.choose(id=1)
+                host_started = True
+                print("  [%s] host clicked start" % m.name)
+            elif "RPS choice" in t:
                 if (m is a and not ra) or (m is b and not rb):
                     m.choose(id=v)
                     if m is a: ra = True
