@@ -2,11 +2,11 @@
   "mcpServers": {
     "ygocli": {
       "type": "stdio",
-      "command": "/home/z/ygocli/ygocli",
+      "command": "/home/z/ygo/bin/release/YGOPro",
       "args": [
-        "mcp",
-        "/home/z/ygocli/example.ydk",
-        "/home/z/ygocli/example.ydk"
+        "--mcp", "-k", "-n", "ygocli",
+        "-h", "127.0.0.1", "-p", "7911",
+        "-w", "ygocli", "-d", "example.ydk", "-j"
       ],
       "env": {}
     }
