@@ -36,6 +36,11 @@ int send_packet(int fd, uint8_t proto);
 // Close a socket fd (no-op for -1).
 void close(int fd);
 
+// True if the last read_packet() failure on any fd was a clean peer close
+// (EOF), as opposed to a timeout. Reset by connect() and reset_eof().
+bool peer_eof();
+void reset_eof();
+
 } // namespace net
 
 #endif // YGOCLI_NET_H

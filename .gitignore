@@ -1,3 +1,4 @@
 replay/
 *.o
 ygocli
+srvpro/

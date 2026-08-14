@@ -3,7 +3,7 @@ SRC := ygocli.cpp net/net.cpp
 OCGCORE_SRCS := $(wildcard ocgcore/*.cpp)
 
 CXX := g++
-CXXFLAGS := -g -O0 -std=c++17 -Iocgcore -Inet
+CXXFLAGS := -g -O0 -std=c++17 -Iocgcore -Inet -I/home/z/llama.cpp/vendor
 LDFLAGS :=
 LDLIBS := -lsqlite3 -lpthread -ldl
 

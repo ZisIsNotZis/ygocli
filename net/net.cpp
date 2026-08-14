@@ -17,6 +17,11 @@
 
 namespace net {
 
+static bool g_eof = false;
+
+bool peer_eof() { return g_eof; }
+void reset_eof() { g_eof = false; }
+
 int listen(const std::string& ip, uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -69,6 +74,7 @@ int connect(const std::string& host, uint16_t port) {
             ::close(fd);
             return -1;
         }
+        g_eof = false;
         return fd;
     }
 
@@ -94,6 +100,7 @@ int connect(const std::string& host, uint16_t port) {
         ::close(fd);
         return -1;
     }
+    g_eof = false;
     return fd;
 }
 
@@ -109,7 +116,8 @@ static bool read_exact(int fd, uint8_t* out, size_t n, int timeout_ms) {
             if (pr <= 0) return false;  // timeout or error
         }
         ssize_t r = ::recv(fd, out + got, n - got, 0);
-        if (r <= 0) return false;
+        if (r == 0) { g_eof = true; return false; }  // clean peer close
+        if (r < 0) return false;
         got += (size_t)r;
     }
     return true;
@@ -131,18 +139,17 @@ int read_packet(int fd, std::vector<uint8_t>& buf, int timeout_ms) {
 int write_packet(int fd, uint8_t proto, const uint8_t* data, size_t len) {
     if (len + 1 > 0xffff) return -1;
     uint16_t packet_len = (uint16_t)(len + 1);
-    uint8_t header[3];
-    std::memcpy(header, &packet_len, 2);
-    header[2] = proto;
-    ssize_t w = ::send(fd, header, 3, MSG_NOSIGNAL);
-    if (w != 3) return -1;
-    if (len > 0) {
-        size_t off = 0;
-        while (off < len) {
-            ssize_t n = ::send(fd, data + off, len - off, MSG_NOSIGNAL);
-            if (n <= 0) return -1;
-            off += (size_t)n;
-        }
+    std::vector<uint8_t> out(len + 3);
+    std::memcpy(out.data(), &packet_len, 2);
+    out[2] = proto;
+    if (len > 0) std::memcpy(out.data() + 3, data, len);
+    // Single send() call: the server (srvpro) rejects a packet whose 2-byte
+    // length header arrives in a different TCP chunk than its payload.
+    size_t off = 0;
+    while (off < out.size()) {
+        ssize_t n = ::send(fd, out.data() + off, out.size() - off, MSG_NOSIGNAL);
+        if (n <= 0) return -1;
+        off += (size_t)n;
     }
     return (int)len;
 }
