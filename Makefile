@@ -20,7 +20,7 @@ endif
 CXXFLAGS += $(LUA_CFLAGS)
 LDLIBS += $(LUA_LIBS)
 
-.PHONY: all clean test-regression test-mass test-fuzz-random
+.PHONY: all clean test-mcp-solo test-mcp-net
 
 all: $(TARGET)
 
@@ -30,11 +30,10 @@ $(TARGET): $(SRC) $(OCGCORE_SRCS)
 clean:
 	rm -f $(TARGET)
 
-test-regression: $(TARGET)
-	bash tests/regression_no_retry.sh
+# MCP solo: no forced (pass-only) prompt may ever reach the agent.
+test-mcp-solo: $(TARGET)
+	python3 tests/mcp_auto_pass_test.py example.ydk
 
-test-mass: $(TARGET)
-	bash tests/mass_autoplay.sh
-
-test-fuzz-random: $(TARGET)
-	bash tests/fuzz_random_choices.sh
+# MCP network: same invariant over a live server + two clients.
+test-mcp-net: $(TARGET)
+	python3 tests/mcp_auto_pass_net_test.py example.ydk
