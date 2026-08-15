@@ -1,4 +1,7 @@
 replay/
 *.o
-ygocli
+ygomcp
+build/
 srvpro/
+__pycache__/
+*.bin
